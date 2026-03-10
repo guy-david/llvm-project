@@ -10415,6 +10415,23 @@ ConstantRange llvm::computeConstantRange(const Value *V, bool ForSigned,
     // TODO: Return ConstantRange.
     setLimitsForBinOp(*BO, Lower, Upper, SQ.IIQ, ForSigned);
     CR = ConstantRange::getNonEmpty(Lower, Upper);
+  } else if (isa<SExtInst>(V) || isa<ZExtInst>(V) || isa<TruncInst>(V)) {
+    auto *CastOp = cast<CastInst>(V);
+    ConstantRange OpCR =
+        computeConstantRange(CastOp->getOperand(0), ForSigned, SQ, Depth + 1);
+    switch (CastOp->getOpcode()) {
+    case Instruction::SExt:
+      CR = OpCR.signExtend(BitWidth);
+      break;
+    case Instruction::ZExt:
+      CR = OpCR.zeroExtend(BitWidth);
+      break;
+    case Instruction::Trunc:
+      CR = OpCR.truncate(BitWidth);
+      break;
+    default:
+      llvm_unreachable("Unexpected cast opcode");
+    }
   } else if (auto *II = dyn_cast<IntrinsicInst>(V))
     CR = getRangeForIntrinsic(*II, SQ.IIQ.UseInstrInfo);
   else if (auto *SI = dyn_cast<SelectInst>(V)) {
