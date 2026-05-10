@@ -3800,6 +3800,116 @@ TEST_F(ValueTrackingTest, ComputeConstantRange) {
   }
 }
 
+TEST_F(ValueTrackingTest, ComputeConstantRangeRecursive) {
+  // Non-recursive analysis cannot see through an add of two sub-ranged
+  // operands; the recursive variant combines their ranges via addWithNoWrap.
+  {
+    auto M = parseModule(R"(
+  define i32 @test(i32 %a, i32 %b) {
+    %sa = lshr i32 %a, 31
+    %sb = lshr i32 %b, 31
+    %sum = add i32 %sa, %sb
+    ret i32 %sum
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *Sum = &findInstructionByName(F, "sum");
+
+    EXPECT_TRUE(computeConstantRange(Sum, /*ForSigned=*/false, SQ).isFullSet());
+
+    ConstantRange CR =
+        computeConstantRangeRecursive(Sum, /*ForSigned=*/false, SQ);
+    EXPECT_EQ(APInt(32, 0), CR.getLower());
+    EXPECT_EQ(APInt(32, 3), CR.getUpper());
+  }
+
+  // NSW/NUW flags tighten the recursive result.
+  {
+    auto M = parseModule(R"(
+  define i8 @test(i8 %a, i8 %b) {
+    %ma = and i8 %a, 15
+    %mb = and i8 %b, 15
+    %sum = add nuw i8 %ma, %mb
+    ret i8 %sum
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *Sum = &findInstructionByName(F, "sum");
+
+    ConstantRange CR =
+        computeConstantRangeRecursive(Sum, /*ForSigned=*/false, SQ);
+    EXPECT_EQ(APInt(8, 0), CR.getLower());
+    EXPECT_EQ(APInt(8, 31), CR.getUpper());
+  }
+
+  // Disjoint OR is equivalent to an nsw+nuw add.
+  {
+    auto M = parseModule(R"(
+  define i8 @test(i8 %a, i8 %b) {
+    %ma = and i8 %a, 12
+    %mb = and i8 %b, 3
+    %r  = or disjoint i8 %ma, %mb
+    ret i8 %r
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *R = &findInstructionByName(F, "r");
+
+    ConstantRange CR =
+        computeConstantRangeRecursive(R, /*ForSigned=*/false, SQ);
+    EXPECT_EQ(APInt(8, 0), CR.getLower());
+    EXPECT_EQ(APInt(8, 16), CR.getUpper());
+  }
+
+  // Recursive mode handles sub with NSW: the switch only matches sub with a
+  // constant LHS, so non-recursive gives the full set, while the recursive
+  // path feeds both operand ranges through subWithNoWrap.
+  {
+    auto M = parseModule(R"(
+  define i8 @test(i8 %a) {
+    %m = and i8 %a, 15
+    %s = sub nsw i8 %m, 3
+    ret i8 %s
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *S = &findInstructionByName(F, "s");
+
+    EXPECT_TRUE(computeConstantRange(S, /*ForSigned=*/true, SQ).isFullSet());
+
+    ConstantRange CR = computeConstantRangeRecursive(S, /*ForSigned=*/true, SQ);
+    EXPECT_EQ(APInt::getAllOnes(8) - 2, CR.getSignedMin()); // -3
+    EXPECT_EQ(APInt(8, 12), CR.getSignedMax());
+  }
+
+  // A three-level add chain of sub-ranged lshrs resolves to [0, 3] under the
+  // looser depth cap.
+  {
+    auto M = parseModule(R"(
+  define i32 @test(i32 %a, i32 %b, i32 %c) {
+    %sa = lshr i32 %a, 31
+    %sb = lshr i32 %b, 31
+    %sc = lshr i32 %c, 31
+    %ab = add i32 %sa, %sb
+    %abc = add i32 %ab, %sc
+    ret i32 %abc
+  })");
+    Function *F = M->getFunction("test");
+    AssumptionCache AC(*F);
+    SimplifyQuery SQ(M->getDataLayout(), /*DT=*/nullptr, &AC);
+    Value *ABC = &findInstructionByName(F, "abc");
+
+    ConstantRange CR =
+        computeConstantRangeRecursive(ABC, /*ForSigned=*/false, SQ);
+    EXPECT_EQ(APInt(32, 0), CR.getLower());
+    EXPECT_EQ(APInt(32, 4), CR.getUpper());
+  }
+}
+
 struct FindAllocaForValueTestParams {
   const char *IR;
   bool AnyOffsetResult;

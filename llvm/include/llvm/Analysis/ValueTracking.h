@@ -690,6 +690,21 @@ LLVM_ABI ConstantRange computeConstantRange(const Value *V, bool ForSigned,
                                             const SimplifyQuery &SQ,
                                             unsigned Depth = 0);
 
+/// Determine the possible constant range of an integer or vector of integer
+/// value, recursively descending into the operands of add/sub/disjoint-or and
+/// combining ranges with the matching no-wrap semantics. Intended for callers
+/// that are willing to trade a little compile time for a tighter range on
+/// chained arithmetic.
+///
+/// Note: the recursion is capped by MaxAnalysisRecursionDepth but is not
+/// memoized, so the cost is exponential in branching width at a given depth.
+/// Use only when the analyzed value is known to be an integer expression a
+/// handful of operations deep, not on arbitrarily large SSA graphs.
+LLVM_ABI ConstantRange computeConstantRangeRecursive(const Value *V,
+                                                     bool ForSigned,
+                                                     const SimplifyQuery &SQ,
+                                                     unsigned Depth = 0);
+
 /// Combine constant ranges from computeConstantRange() and computeKnownBits().
 LLVM_ABI ConstantRange computeConstantRangeIncludingKnownBits(
     const WithCache<const Value *> &V, bool ForSigned, const SimplifyQuery &SQ);

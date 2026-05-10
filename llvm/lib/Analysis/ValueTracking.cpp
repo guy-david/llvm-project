@@ -9976,10 +9976,18 @@ std::optional<bool> llvm::isImpliedByDomCondition(CmpPredicate Pred,
   return std::nullopt;
 }
 
-static void setLimitsForBinOp(const BinaryOperator &BO, APInt &Lower,
-                              APInt &Upper, const InstrInfoQuery &IIQ,
-                              bool PreferSignedRange) {
-  unsigned Width = Lower.getBitWidth();
+static ConstantRange computeConstantRangeImpl(const Value *V, bool ForSigned,
+                                              const SimplifyQuery &SQ,
+                                              unsigned Depth, bool Recursive);
+
+static ConstantRange getRangeForBinOp(const BinaryOperator &BO,
+                                      bool PreferSignedRange,
+                                      const SimplifyQuery &SQ, unsigned Depth,
+                                      bool Recursive) {
+  unsigned Width = BO.getType()->getScalarSizeInBits();
+  const InstrInfoQuery &IIQ = SQ.IIQ;
+  APInt Lower = APInt(Width, 0);
+  APInt Upper = APInt(Width, 0);
   const APInt *C;
   switch (BO.getOpcode()) {
   case Instruction::Sub:
@@ -10199,6 +10207,38 @@ static void setLimitsForBinOp(const BinaryOperator &BO, APInt &Lower,
   default:
     break;
   }
+
+  ConstantRange CR = ConstantRange::getNonEmpty(Lower, Upper);
+  if (!Recursive)
+    return CR;
+
+  bool IsDisjointOr = BO.getOpcode() == Instruction::Or &&
+                      cast<PossiblyDisjointInst>(&BO)->isDisjoint();
+  if (BO.getOpcode() == Instruction::Add ||
+      BO.getOpcode() == Instruction::Sub || IsDisjointOr) {
+    ConstantRange LHS = computeConstantRangeImpl(
+        BO.getOperand(0), PreferSignedRange, SQ, Depth + 1, Recursive);
+    ConstantRange RHS = computeConstantRangeImpl(
+        BO.getOperand(1), PreferSignedRange, SQ, Depth + 1, Recursive);
+    unsigned NoWrapKind = 0;
+    if (IsDisjointOr) {
+      // Disjoint OR is semantically equivalent to 'add nsw nuw': no bit
+      // overlap means neither signed nor unsigned wrap is possible.
+      NoWrapKind = OverflowingBinaryOperator::NoSignedWrap |
+                   OverflowingBinaryOperator::NoUnsignedWrap;
+    } else {
+      if (IIQ.hasNoUnsignedWrap(&BO))
+        NoWrapKind |= OverflowingBinaryOperator::NoUnsignedWrap;
+      if (IIQ.hasNoSignedWrap(&BO))
+        NoWrapKind |= OverflowingBinaryOperator::NoSignedWrap;
+    }
+    ConstantRange OpCR = BO.getOpcode() == Instruction::Sub
+                             ? LHS.subWithNoWrap(RHS, NoWrapKind)
+                             : LHS.addWithNoWrap(RHS, NoWrapKind);
+    CR = CR.intersectWith(OpCR, PreferSignedRange ? ConstantRange::Signed
+                                                  : ConstantRange::Unsigned);
+  }
+  return CR;
 }
 
 static ConstantRange getRangeForIntrinsic(const IntrinsicInst &II,
@@ -10381,6 +10421,19 @@ static void setLimitForFPToI(const Instruction *I, APInt &Lower, APInt &Upper) {
 ConstantRange llvm::computeConstantRange(const Value *V, bool ForSigned,
                                          const SimplifyQuery &SQ,
                                          unsigned Depth) {
+  return computeConstantRangeImpl(V, ForSigned, SQ, Depth, /*Recursive=*/false);
+}
+
+ConstantRange llvm::computeConstantRangeRecursive(const Value *V,
+                                                  bool ForSigned,
+                                                  const SimplifyQuery &SQ,
+                                                  unsigned Depth) {
+  return computeConstantRangeImpl(V, ForSigned, SQ, Depth, /*Recursive=*/true);
+}
+
+static ConstantRange computeConstantRangeImpl(const Value *V, bool ForSigned,
+                                              const SimplifyQuery &SQ,
+                                              unsigned Depth, bool Recursive) {
   assert(V->getType()->isIntOrIntVectorTy() && "Expected integer instruction");
 
   if (Depth == MaxAnalysisRecursionDepth)
@@ -10392,24 +10445,20 @@ ConstantRange llvm::computeConstantRange(const Value *V, bool ForSigned,
   unsigned BitWidth = V->getType()->getScalarSizeInBits();
   ConstantRange CR = ConstantRange::getFull(BitWidth);
   if (auto *BO = dyn_cast<BinaryOperator>(V)) {
-    APInt Lower = APInt(BitWidth, 0);
-    APInt Upper = APInt(BitWidth, 0);
-    // TODO: Return ConstantRange.
-    setLimitsForBinOp(*BO, Lower, Upper, SQ.IIQ, ForSigned);
-    CR = ConstantRange::getNonEmpty(Lower, Upper);
+    CR = getRangeForBinOp(*BO, ForSigned, SQ, Depth, Recursive);
   } else if (auto *II = dyn_cast<IntrinsicInst>(V))
     CR = getRangeForIntrinsic(*II, SQ.IIQ.UseInstrInfo);
   else if (auto *SI = dyn_cast<SelectInst>(V)) {
-    ConstantRange CRTrue =
-        computeConstantRange(SI->getTrueValue(), ForSigned, SQ, Depth + 1);
-    ConstantRange CRFalse =
-        computeConstantRange(SI->getFalseValue(), ForSigned, SQ, Depth + 1);
+    ConstantRange CRTrue = computeConstantRangeImpl(
+        SI->getTrueValue(), ForSigned, SQ, Depth + 1, Recursive);
+    ConstantRange CRFalse = computeConstantRangeImpl(
+        SI->getFalseValue(), ForSigned, SQ, Depth + 1, Recursive);
     CR = CRTrue.unionWith(CRFalse);
     CR = CR.intersectWith(getRangeForSelectPattern(*SI, SQ.IIQ));
   } else if (isa<SExtInst>(V) || isa<ZExtInst>(V) || isa<TruncInst>(V)) {
     auto *CastOp = cast<CastInst>(V);
-    ConstantRange OpCR =
-        computeConstantRange(CastOp->getOperand(0), ForSigned, SQ, Depth + 1);
+    ConstantRange OpCR = computeConstantRangeImpl(
+        CastOp->getOperand(0), ForSigned, SQ, Depth + 1, Recursive);
     switch (CastOp->getOpcode()) {
     case Instruction::SExt:
       CR = OpCR.signExtend(BitWidth);
@@ -10426,7 +10475,6 @@ ConstantRange llvm::computeConstantRange(const Value *V, bool ForSigned,
   } else if (isa<FPToUIInst>(V) || isa<FPToSIInst>(V)) {
     APInt Lower = APInt(BitWidth, 0);
     APInt Upper = APInt(BitWidth, 0);
-    // TODO: Return ConstantRange.
     setLimitForFPToI(cast<Instruction>(V), Lower, Upper);
     CR = ConstantRange::getNonEmpty(Lower, Upper);
   } else if (const auto *A = dyn_cast<Argument>(V))
