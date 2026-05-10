@@ -151,6 +151,7 @@ private:
   bool foldSignBitReductionCmp(Instruction &I);
   bool foldICmpEqZeroVectorReduce(Instruction &I);
   bool foldEquivalentReductionCmp(Instruction &I);
+  bool foldReduceAddCmpZero(Instruction &I);
   bool foldSelectShuffle(Instruction &I, bool FromReduction = false);
   bool foldInterleaveIntrinsics(Instruction &I);
   bool shrinkType(Instruction &I);
@@ -4866,6 +4867,98 @@ bool VectorCombine::foldEquivalentReductionCmp(Instruction &I) {
   return true;
 }
 
+/// Fold (icmp eq/ne (reduce.add X), 0) to (icmp eq/ne (reduce.or/umax X), 0)
+/// when X elements are known non-negative or non-positive, making sum==0
+/// equivalent to all-zeros.
+bool VectorCombine::foldReduceAddCmpZero(Instruction &I) {
+  CmpPredicate Pred;
+  Value *Vec;
+  if (!match(&I, m_ICmp(Pred,
+                        m_OneUse(m_Intrinsic<Intrinsic::vector_reduce_add>(
+                            m_Value(Vec))),
+                        m_Zero())))
+    return false;
+
+  auto *VecTy = dyn_cast<FixedVectorType>(Vec->getType());
+  if (!VecTy)
+    return false;
+
+  // Require non-negative or non-positive elements so sum == 0 iff all are 0.
+  // Use the recursive constant range so that e.g. sext i1 (range {-1, 0}) is
+  // detected as non-positive and ranged add/sub chains get tightened bounds.
+  SimplifyQuery Q = SQ.getWithInstruction(&I);
+  ConstantRange CR = computeConstantRangeRecursive(Vec, /*ForSigned=*/true, Q);
+  if (CR.isEmptySet())
+    return false;
+  bool IsNonNegative = CR.getSignedMin().isNonNegative();
+  bool IsNonPositive = CR.getSignedMax().isNonPositive();
+  if (!IsNonNegative && !IsNonPositive)
+    return false;
+  unsigned NumSignBits = IsNonNegative ? CR.getUnsignedMax().countLeadingZeros()
+                                       : CR.getSignedMin().countLeadingOnes();
+
+  // Check that sum cannot wrap to zero. Adding N elements loses at most
+  // floor(log2(N)) sign bits, so we need log2(NumElts) < NumSignBits.
+  unsigned NumElts = VecTy->getNumElements();
+  if (Log2_32(NumElts) >= NumSignBits)
+    return false;
+
+  ICmpInst::Predicate NewPred;
+  switch (Pred) {
+  case ICmpInst::ICMP_EQ:
+  case ICmpInst::ICMP_ULE:
+  case ICmpInst::ICMP_SLE:
+  case ICmpInst::ICMP_SGE:
+    NewPred = ICmpInst::ICMP_EQ;
+    break;
+  case ICmpInst::ICMP_NE:
+  case ICmpInst::ICMP_UGT:
+  case ICmpInst::ICMP_SGT:
+  case ICmpInst::ICMP_SLT:
+    NewPred = ICmpInst::ICMP_NE;
+    break;
+  default:
+    return false;
+  }
+
+  // For signed predicates, need a tighter bound to prevent a sign flip.
+  if (!IsNonNegative &&
+      (Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SLE))
+    return false;
+  if (!IsNonPositive &&
+      (Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SGE))
+    return false;
+  if ((Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SLE ||
+       Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SGE) &&
+      Log2_32(NumElts) >= NumSignBits - 1)
+    return false;
+
+  // Prefer OR over UMAX over ADD for simpler semantics.
+  InstructionCost OrigCost = TTI.getArithmeticReductionCost(
+      Instruction::Add, VecTy, std::nullopt, CostKind);
+  InstructionCost OrCost = TTI.getArithmeticReductionCost(
+      Instruction::Or, VecTy, std::nullopt, CostKind);
+  InstructionCost UmaxCost = TTI.getMinMaxReductionCost(
+      Intrinsic::umax, VecTy, FastMathFlags(), CostKind);
+  bool UseOr = OrCost <= UmaxCost;
+  InstructionCost AltCost = UseOr ? OrCost : UmaxCost;
+  LLVM_DEBUG(dbgs() << "Found equivalent reduction cmp: " << I
+                    << "\n  OrigCost: " << OrigCost
+                    << " vs AltCost: " << AltCost << "\n");
+  if (AltCost > OrigCost)
+    return false;
+
+  Builder.SetInsertPoint(&I);
+  Value *NewReduce = UseOr ? Builder.CreateOrReduce(Vec)
+                           : Builder.CreateIntrinsic(
+                                 Intrinsic::vector_reduce_umax, {VecTy}, {Vec});
+  Worklist.pushValue(NewReduce);
+  Value *NewCmp = Builder.CreateICmp(
+      NewPred, NewReduce, ConstantInt::getNullValue(VecTy->getScalarType()));
+  replaceValue(I, *NewCmp);
+  return true;
+}
+
 /// Returns true if this ShuffleVectorInst eventually feeds into a
 /// vector reduction intrinsic (e.g., vector_reduce_add) by only following
 /// chains of shuffles and binary operators (in any combination/order).
@@ -5908,6 +6001,8 @@ bool VectorCombine::run() {
         if (foldICmpEqZeroVectorReduce(I))
           return true;
         if (foldEquivalentReductionCmp(I))
+          return true;
+        if (foldReduceAddCmpZero(I))
           return true;
         [[fallthrough]];
       case Instruction::FCmp:
