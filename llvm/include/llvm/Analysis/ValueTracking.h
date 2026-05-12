@@ -186,6 +186,10 @@ LLVM_ABI bool isKnownPositive(const Value *V, const SimplifyQuery &SQ,
 LLVM_ABI bool isKnownNegative(const Value *V, const SimplifyQuery &SQ,
                               unsigned Depth = 0);
 
+/// Returns true if the given value is known to be non-positive.
+LLVM_ABI bool isKnownNonPositive(const Value *V, const SimplifyQuery &SQ,
+                                 unsigned Depth = 0);
+
 /// Return true if the given values are known to be non-equal when defined.
 /// Supports scalar integer types only.
 LLVM_ABI bool isKnownNonEqual(const Value *V1, const Value *V2,

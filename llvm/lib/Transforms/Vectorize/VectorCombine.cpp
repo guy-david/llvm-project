@@ -151,6 +151,7 @@ private:
   bool foldSignBitReductionCmp(Instruction &I);
   bool foldICmpEqZeroVectorReduce(Instruction &I);
   bool foldEquivalentReductionCmp(Instruction &I);
+  bool foldReduceAddCmpZero(Instruction &I);
   bool foldSelectShuffle(Instruction &I, bool FromReduction = false);
   bool foldInterleaveIntrinsics(Instruction &I);
   bool shrinkType(Instruction &I);
@@ -4893,6 +4894,90 @@ bool VectorCombine::foldEquivalentReductionCmp(Instruction &I) {
   return true;
 }
 
+/// Fold (icmp pred (reduce.add X), 0) to (icmp pred' (reduce.or X), 0) when X
+/// has lanes known to all be non-negative or all non-positive, so that
+/// sum == 0 iff every lane is 0. Falls back to reduce.umax if reduce.or is
+/// more expensive on the target.
+bool VectorCombine::foldReduceAddCmpZero(Instruction &I) {
+  CmpPredicate Pred;
+  Value *Vec;
+  if (!match(&I, m_ICmp(Pred,
+                        m_OneUse(m_Intrinsic<Intrinsic::vector_reduce_add>(
+                            m_Value(Vec))),
+                        m_Zero())))
+    return false;
+
+  auto *VecTy = dyn_cast<FixedVectorType>(Vec->getType());
+  if (!VecTy)
+    return false;
+
+  SimplifyQuery Q = SQ.getWithInstruction(&I);
+  bool IsNonNegative = isKnownNonNegative(Vec, Q);
+  bool IsNonPositive = !IsNonNegative && isKnownNonPositive(Vec, Q);
+  if (!IsNonNegative && !IsNonPositive)
+    return false;
+
+  // ComputeNumSignBits handles sext/zext/add/sub trees natively; summing N
+  // elements consumes at most log2(N) sign bits, so requiring at least
+  // log2(N) + 1 ensures the sum cannot wrap to zero.
+  unsigned NumElts = VecTy->getNumElements();
+  unsigned NumSignBits = ComputeNumSignBits(Vec, *DL, SQ.AC, &I, &DT);
+  if (Log2_32(NumElts) >= NumSignBits)
+    return false;
+
+  ICmpInst::Predicate NewPred;
+  switch (Pred) {
+  case ICmpInst::ICMP_EQ:
+  case ICmpInst::ICMP_ULE:
+  case ICmpInst::ICMP_SLE:
+  case ICmpInst::ICMP_SGE:
+    NewPred = ICmpInst::ICMP_EQ;
+    break;
+  case ICmpInst::ICMP_NE:
+  case ICmpInst::ICMP_UGT:
+  case ICmpInst::ICMP_SGT:
+  case ICmpInst::ICMP_SLT:
+    NewPred = ICmpInst::ICMP_NE;
+    break;
+  default:
+    return false;
+  }
+
+  // Signed inequalities need an extra sign bit of headroom so the sum cannot
+  // flip sign; and some signed predicates are only sound in one sign class.
+  if (!IsNonNegative &&
+      (Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SLE))
+    return false;
+  if (!IsNonPositive &&
+      (Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SGE))
+    return false;
+  if ((Pred == ICmpInst::ICMP_SGT || Pred == ICmpInst::ICMP_SLE ||
+       Pred == ICmpInst::ICMP_SLT || Pred == ICmpInst::ICMP_SGE) &&
+      Log2_32(NumElts) >= NumSignBits - 1)
+    return false;
+
+  InstructionCost OrigCost = TTI.getArithmeticReductionCost(
+      Instruction::Add, VecTy, std::nullopt, CostKind);
+  InstructionCost OrCost = TTI.getArithmeticReductionCost(
+      Instruction::Or, VecTy, std::nullopt, CostKind);
+  InstructionCost UmaxCost = TTI.getMinMaxReductionCost(
+      Intrinsic::umax, VecTy, FastMathFlags(), CostKind);
+  bool UseOr = OrCost <= UmaxCost;
+  InstructionCost AltCost = UseOr ? OrCost : UmaxCost;
+  if (AltCost > OrigCost)
+    return false;
+
+  Builder.SetInsertPoint(&I);
+  Value *NewReduce = UseOr ? Builder.CreateOrReduce(Vec)
+                           : Builder.CreateIntrinsic(
+                                 Intrinsic::vector_reduce_umax, {VecTy}, {Vec});
+  Worklist.pushValue(NewReduce);
+  Value *NewCmp = Builder.CreateICmp(
+      NewPred, NewReduce, ConstantInt::getNullValue(VecTy->getScalarType()));
+  replaceValue(I, *NewCmp);
+  return true;
+}
+
 /// Returns true if this ShuffleVectorInst eventually feeds into a
 /// vector reduction intrinsic (e.g., vector_reduce_add) by only following
 /// chains of shuffles and binary operators (in any combination/order).
@@ -5935,6 +6020,8 @@ bool VectorCombine::run() {
         if (foldICmpEqZeroVectorReduce(I))
           return true;
         if (foldEquivalentReductionCmp(I))
+          return true;
+        if (foldReduceAddCmpZero(I))
           return true;
         [[fallthrough]];
       case Instruction::FCmp:

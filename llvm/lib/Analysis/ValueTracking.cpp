@@ -279,6 +279,9 @@ bool llvm::isKnownToBeAPowerOfTwo(const Value *V, const DataLayout &DL,
 static bool isKnownNonZero(const Value *V, const APInt &DemandedElts,
                            const SimplifyQuery &Q, unsigned Depth);
 
+static unsigned ComputeNumSignBits(const Value *V, const SimplifyQuery &Q,
+                                   unsigned Depth);
+
 bool llvm::isKnownNonNegative(const Value *V, const SimplifyQuery &SQ,
                               unsigned Depth) {
   return computeKnownBits(V, SQ, Depth).isNonNegative();
@@ -299,6 +302,50 @@ bool llvm::isKnownPositive(const Value *V, const SimplifyQuery &SQ,
 bool llvm::isKnownNegative(const Value *V, const SimplifyQuery &SQ,
                            unsigned Depth) {
   return computeKnownBits(V, SQ, Depth).isNegative();
+}
+
+bool llvm::isKnownNonPositive(const Value *V, const SimplifyQuery &SQ,
+                              unsigned Depth) {
+  // Any value whose sign bit is known set is negative, hence non-positive.
+  // All-zero constants are also recognized by KnownBits.
+  KnownBits Known = computeKnownBits(V, SQ, Depth);
+  if (Known.isNegative() || Known.isZero())
+    return true;
+
+  if (Depth >= MaxAnalysisRecursionDepth)
+    return false;
+
+  // Any value whose bits all match the sign bit is in {0, -1} per lane, which
+  // is non-positive. This subsumes sext <? x i1> and ashr X, BitWidth-1 among
+  // others — cases where the per-lane bits are correlated with a single input
+  // bit and so computeKnownBits cannot resolve them on its own.
+  if (::ComputeNumSignBits(V, SQ, Depth) ==
+      V->getType()->getScalarSizeInBits())
+    return true;
+
+  Value *A, *B;
+
+  // Negation of a non-negative value.
+  if (match(V, m_Neg(m_Value(A))))
+    return isKnownNonNegative(A, SQ, Depth + 1);
+
+  // Non-positive + non-positive is non-positive (result type permitting; here
+  // we rely on the subsequent overflow checks done by the caller).
+  if (match(V, m_Add(m_Value(A), m_Value(B))))
+    return isKnownNonPositive(A, SQ, Depth + 1) &&
+           isKnownNonPositive(B, SQ, Depth + 1);
+
+  // Non-positive minus non-negative stays non-positive.
+  if (match(V, m_Sub(m_Value(A), m_Value(B))))
+    return isKnownNonPositive(A, SQ, Depth + 1) &&
+           isKnownNonNegative(B, SQ, Depth + 1);
+
+  // Select of two non-positive arms.
+  if (match(V, m_Select(m_Value(), m_Value(A), m_Value(B))))
+    return isKnownNonPositive(A, SQ, Depth + 1) &&
+           isKnownNonPositive(B, SQ, Depth + 1);
+
+  return false;
 }
 
 static bool isKnownNonEqual(const Value *V1, const Value *V2,
