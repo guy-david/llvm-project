@@ -91,11 +91,9 @@ static bool isDereferenceableAndAlignedPointer(
     const Value *Base = GEP->getPointerOperand();
 
     APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
-    if (!GEP->accumulateConstantOffset(DL, Offset) || Offset.isNegative() ||
-        !Offset.urem(APInt(Offset.getBitWidth(), Alignment.value()))
-             .isMinValue())
-      return false;
-
+    if (GEP->accumulateConstantOffset(DL, Offset) && !Offset.isNegative() &&
+        Offset.urem(APInt(Offset.getBitWidth(), Alignment.value()))
+            .isMinValue()) {
     // If the base pointer is dereferenceable for Offset+Size bytes, then the
     // GEP (== Base + Offset) is dereferenceable for Size bytes.  If the base
     // pointer is aligned to Align bytes, and the Offset is divisible by Align
@@ -107,6 +105,9 @@ static bool isDereferenceableAndAlignedPointer(
     return isDereferenceableAndAlignedPointer(
         Base, Alignment, Offset + Size.sextOrTrunc(Offset.getBitWidth()), DL,
         CtxI, AC, DT, TLI, Visited, MaxDepth);
+    }
+    // For non-constant offsets, fall through to check assumptions directly
+    // on the GEP result pointer.
   }
 
   // bitcast instructions are no-ops as far as dereferenceability is concerned.
