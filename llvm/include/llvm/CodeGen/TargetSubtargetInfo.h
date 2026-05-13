@@ -193,6 +193,16 @@ public:
     return false;
   }
 
+  /// Returns true if a COPY from \p SrcReg to \p DestReg will be eliminated
+  /// by the hardware (e.g. handled at register renaming with zero latency).
+  /// This is the register-pair variant of move elimination: it answers whether
+  /// a not-yet-formed COPY between two physical registers would be free.
+  ///
+  /// Subtargets that support zero-cycle register moves should override this.
+  virtual bool isCopyZeroCost(MCRegister DestReg, MCRegister SrcReg) const {
+    return false;
+  }
+
   /// True if the subtarget should run MachineScheduler after aggressive
   /// coalescing.
   ///

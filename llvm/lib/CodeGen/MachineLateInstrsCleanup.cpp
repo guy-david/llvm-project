@@ -21,6 +21,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineOperand.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -34,18 +35,81 @@ using namespace llvm;
 #define DEBUG_TYPE "machine-latecleanup"
 
 STATISTIC(NumRemoved, "Number of redundant instructions removed.");
+STATISTIC(NumCoalesced, "Number of redundant instructions coalesced to COPY.");
 
 namespace {
 
 class MachineLateInstrsCleanup {
   const TargetRegisterInfo *TRI = nullptr;
   const TargetInstrInfo *TII = nullptr;
+  const TargetSubtargetInfo *STI = nullptr;
+  bool OptimizeForSize = false;
+  unsigned CopySize = 0;
 
   // Data structures to map regs to their definitions and kills per MBB.
   struct Reg2MIMap : public SmallDenseMap<Register, MachineInstr *> {
+    // Side map: hash of instruction (ignoring defs) → register.
+    // Enables O(1) lookup for cross-register coalescing. Hash collisions
+    // between different instructions may cause missed optimizations but
+    // never incorrect transforms, since findIdenticalIgnoringDefs always
+    // verifies with isIdenticalTo.
+    SmallDenseMap<unsigned, Register> HashToReg;
+
     bool hasIdentical(Register Reg, MachineInstr *ArgMI) {
       MachineInstr *MI = lookup(Reg);
       return MI && MI->isIdenticalTo(*ArgMI);
+    }
+
+    /// Compute a hash of MI that ignores def operands, suitable for
+    /// detecting identical instructions defining different registers.
+    static unsigned hashIgnoringDefs(const MachineInstr *MI) {
+      SmallVector<size_t, 8> Components;
+      Components.push_back(MI->getOpcode());
+      for (const MachineOperand &MO : MI->operands())
+        if (!(MO.isReg() && MO.isDef()))
+          Components.push_back(hash_value(MO));
+      return hash_combine_range(Components);
+    }
+
+    /// Find any tracked definition whose instruction is identical to ArgMI
+    /// ignoring the destination register. Returns the register of the matching
+    /// definition, or NoRegister if none found.
+    Register findIdenticalIgnoringDefs(MachineInstr *ArgMI) {
+      unsigned Hash = hashIgnoringDefs(ArgMI);
+      auto It = HashToReg.find(Hash);
+      if (It == HashToReg.end())
+        return MCRegister::NoRegister;
+      MachineInstr *MI = lookup(It->second);
+      if (MI && MI->isIdenticalTo(*ArgMI, MachineInstr::IgnoreDefs))
+        return It->second;
+      return MCRegister::NoRegister;
+    }
+
+    void insertDef(Register Reg, MachineInstr *MI) {
+      // Clean up any stale hash entry if Reg already has a def with a
+      // different hash (re-definition with a different instruction).
+      unsigned NewHash = hashIgnoringDefs(MI);
+      auto It = find(Reg);
+      if (It != end()) {
+        unsigned OldHash = hashIgnoringDefs(It->second);
+        if (OldHash != NewHash)
+          HashToReg.erase(OldHash);
+      }
+      (*this)[Reg] = MI;
+      HashToReg[NewHash] = Reg;
+    }
+
+    void eraseDef(Register Reg) {
+      auto It = find(Reg);
+      if (It != end()) {
+        HashToReg.erase(hashIgnoringDefs(It->second));
+        erase(It);
+      }
+    }
+
+    void clearDefs() {
+      clear();
+      HashToReg.clear();
     }
   };
   typedef SmallDenseMap<Register, TinyPtrVector<MachineInstr *>> Reg2MIVecMap;
@@ -110,8 +174,28 @@ MachineLateInstrsCleanupPass::run(MachineFunction &MF,
 }
 
 bool MachineLateInstrsCleanup::run(MachineFunction &MF) {
-  TRI = MF.getSubtarget().getRegisterInfo();
-  TII = MF.getSubtarget().getInstrInfo();
+  STI = &MF.getSubtarget();
+  TRI = STI->getRegisterInfo();
+  TII = STI->getInstrInfo();
+  OptimizeForSize =
+      MF.getFunction().hasOptSize() || MF.getFunction().hasMinSize();
+
+  // Compute the size of a COPY instruction via getInstSizeInBytes, which
+  // accounts for target-specific instruction encoding. We build a temporary
+  // COPY, measure it, then erase it.
+  CopySize = 0;
+  if (OptimizeForSize && !MF.empty()) {
+    MachineBasicBlock &MBB = MF.front();
+    Register Reg = TRI->getAllocatableSet(MF).find_first();
+    if (Reg.isValid()) {
+      auto TmpCopy =
+          BuildMI(MBB, MBB.begin(), DebugLoc(), TII->get(TargetOpcode::COPY),
+                  Reg)
+              .addReg(Reg);
+      CopySize = TII->getInstSizeInBytes(*TmpCopy);
+      TmpCopy->eraseFromParent();
+    }
+  }
 
   RegDefs.clear();
   RegDefs.resize(MF.getNumBlockIDs());
@@ -147,7 +231,11 @@ void MachineLateInstrsCleanup::clearKillsForDef(Register Reg,
   // Definition in current MBB: done.
   Reg2MIMap &MBBDefs = RegDefs[MBB->getNumber()];
   MachineInstr *DefMI = MBBDefs[Reg];
-  assert(DefMI->isIdenticalTo(*ToRemoveMI) && "Previous def not identical?");
+  // The earlier def must match the removed MI aside from its destination
+  // register: the same-register case requires full identity, while the
+  // coalesce-to-COPY case keeps the same operation with a different def.
+  assert(DefMI->isIdenticalTo(*ToRemoveMI, MachineInstr::IgnoreDefs) &&
+         "Previous def not identical?");
   if (DefMI->getParent() == MBB)
     return;
 
@@ -211,7 +299,7 @@ bool MachineLateInstrsCleanup::processBlock(MachineBasicBlock *MBB) {
               [&, &Reg = Reg, &DefMI = DefMI](const MachineBasicBlock *Pred) {
                 return RegDefs[Pred->getNumber()].hasIdentical(Reg, DefMI);
               })) {
-        MBBDefs[Reg] = DefMI;
+        MBBDefs.insertDef(Reg, DefMI);
         LLVM_DEBUG(dbgs() << "Reusable instruction from pred(s): in "
                           << printMBBReference(*MBB) << ":  " << *DefMI);
       }
@@ -225,7 +313,7 @@ bool MachineLateInstrsCleanup::processBlock(MachineBasicBlock *MBB) {
     // If FrameReg is modified, no previous load-address instructions (using
     // it) are valid.
     if (MI.modifiesRegister(FrameReg, TRI)) {
-      MBBDefs.clear();
+      MBBDefs.clearDefs();
       MBBKills.clear();
       continue;
     }
@@ -242,11 +330,68 @@ bool MachineLateInstrsCleanup::processBlock(MachineBasicBlock *MBB) {
       continue;
     }
 
+    // Check for an identical instruction defining a different register.
+    // If found and the source register is still live (tracked in MBBDefs),
+    // replace this instruction with a COPY.
+    // MachineCopyPropagation runs immediately after this pass and will
+    // forward-propagate the source register to the COPY's uses when possible,
+    // effectively merging both defs into a single physical register.
+    // Coalesce when either:
+    //  - Optimizing for size and the instruction is larger than a COPY (net
+    //    code size reduction), or
+    //  - The target reports that a COPY between these registers is zero-cost
+    //    (e.g. eliminated via register renaming), trading a multi-cycle
+    //    materialization for a free copy.
+    if (IsCandidate) {
+      Register SrcReg = MBBDefs.findIdenticalIgnoringDefs(&MI);
+      if (SrcReg.isValid() && SrcReg != DefedReg) {
+        bool SizeProfitable =
+            OptimizeForSize && CopySize &&
+            TII->getInstSizeInBytes(MI) > CopySize;
+        bool ZeroCostCopy =
+            STI->isCopyZeroCost(DefedReg.asMCReg(), SrcReg.asMCReg());
+        if (SizeProfitable || ZeroCostCopy) {
+          // Check that a COPY from SrcReg to DefedReg is valid: the source
+          // must be in some register class that contains the destination, or
+          // vice versa (i.e. they share a common register class).
+          const TargetRegisterClass *SrcRC =
+              TRI->getMinimalPhysRegClass(SrcReg);
+          const TargetRegisterClass *DstRC =
+              TRI->getMinimalPhysRegClass(DefedReg);
+          if (SrcRC->contains(DefedReg) || DstRC->contains(SrcReg) ||
+              TRI->getCommonSubClass(SrcRC, DstRC)) {
+            LLVM_DEBUG(dbgs()
+                       << "Coalescing to COPY from $" << TRI->getName(SrcReg)
+                       << " in " << printMBBReference(*MBB) << ":  " << MI);
+            // Extend the live range of SrcReg up to this point: clear any
+            // kill flags between the earlier def and here, and add SrcReg
+            // as live-in to blocks along the path if the def is in a
+            // predecessor.
+            BitVector VisitedPreds(MI.getMF()->getNumBlockIDs());
+            clearKillsForDef(SrcReg, MBB, VisitedPreds, &MI);
+            // Replace the instruction with a COPY. This is safe because
+            // isCandidate() guarantees exactly one explicit def (operand 0)
+            // and no implicit operands, so stripping all operands after the
+            // def and adding the source register produces a valid COPY.
+            MI.setDesc(TII->get(TargetOpcode::COPY));
+            while (MI.getNumOperands() > 1)
+              MI.removeOperand(MI.getNumOperands() - 1);
+            MI.addOperand(MachineOperand::CreateReg(SrcReg, /*isDef=*/false));
+            ++NumCoalesced;
+            Changed = true;
+            // Track this definition for future same-register elimination.
+            MBBDefs.insertDef(DefedReg, MBBDefs.lookup(SrcReg));
+            continue;
+          }
+        }
+      }
+    }
+
     // Clear any entries in map that MI clobbers.
     for (auto DefI : llvm::make_early_inc_range(MBBDefs)) {
       Register Reg = DefI.first;
       if (MI.modifiesRegister(Reg, TRI)) {
-        MBBDefs.erase(Reg);
+        MBBDefs.eraseDef(Reg);
         MBBKills.erase(Reg);
       } else if (MI.findRegisterUseOperandIdx(Reg, TRI, true /*isKill*/) != -1)
         // Keep track of all instructions that fully or partially kills Reg.
@@ -257,7 +402,7 @@ bool MachineLateInstrsCleanup::processBlock(MachineBasicBlock *MBB) {
     if (IsCandidate) {
       LLVM_DEBUG(dbgs() << "Found interesting instruction in "
                         << printMBBReference(*MBB) << ":  " << MI);
-      MBBDefs[DefedReg] = &MI;
+      MBBDefs.insertDef(DefedReg, &MI);
       assert(!MBBKills.count(DefedReg) && "Should already have been removed.");
     }
   }

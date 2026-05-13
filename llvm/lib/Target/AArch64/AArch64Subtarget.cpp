@@ -570,6 +570,39 @@ bool AArch64Subtarget::enableEarlyIfConversion() const {
   return EnableEarlyIfConvert;
 }
 
+bool AArch64Subtarget::isCopyZeroCost(MCRegister DestReg,
+                                      MCRegister SrcReg) const {
+  // GPR64 zero-cycle moves.
+  if (AArch64::GPR64RegClass.contains(DestReg) &&
+      AArch64::GPR64RegClass.contains(SrcReg))
+    return hasZeroCycleRegMoveGPR64();
+
+  // GPR32 zero-cycle moves. Targets with GPR64 zero-cycle moves can widen
+  // the copy to 64 bits, so they cover GPR32 as well.
+  if (AArch64::GPR32RegClass.contains(DestReg) &&
+      AArch64::GPR32RegClass.contains(SrcReg))
+    return hasZeroCycleRegMoveGPR32() || hasZeroCycleRegMoveGPR64();
+
+  // FPR128 zero-cycle moves.
+  if (AArch64::FPR128RegClass.contains(DestReg) &&
+      AArch64::FPR128RegClass.contains(SrcReg))
+    return hasZeroCycleRegMoveFPR128();
+
+  // FPR64 zero-cycle moves. Targets with FPR128 zero-cycle moves can widen
+  // the copy to 128 bits, so they cover FPR64 as well.
+  if (AArch64::FPR64RegClass.contains(DestReg) &&
+      AArch64::FPR64RegClass.contains(SrcReg))
+    return hasZeroCycleRegMoveFPR64() || hasZeroCycleRegMoveFPR128();
+
+  // FPR32 zero-cycle moves. Wider register class zero-cycle moves also apply.
+  if (AArch64::FPR32RegClass.contains(DestReg) &&
+      AArch64::FPR32RegClass.contains(SrcReg))
+    return hasZeroCycleRegMoveFPR32() || hasZeroCycleRegMoveFPR64() ||
+           hasZeroCycleRegMoveFPR128();
+
+  return false;
+}
+
 bool AArch64Subtarget::supportsAddressTopByteIgnored() const {
   if (!UseAddressTopByteIgnored)
     return false;

@@ -1,0 +1,300 @@
+# RUN: llc -mtriple=aarch64 -run-pass=machine-latecleanup -verify-machineinstrs \
+# RUN:   %s -o - | FileCheck %s
+# RUN: llc -mtriple=aarch64 -mattr=+zcm-gpr64 -run-pass=machine-latecleanup \
+# RUN:   -verify-machineinstrs %s -o - | FileCheck %s --check-prefix=ZCM
+
+# Test that MachineLateInstrsCleanup coalesces identical candidate
+# instructions defining different registers into COPY when optimizing
+# for size or when the target has zero-cycle register moves.
+
+--- |
+  @g = external global i32
+
+  define void @test_movi64imm_optsize(ptr %p, ptr %q) optsize {
+    ret void
+  }
+
+  define void @test_movi64imm_clobbered(ptr %p) optsize {
+    ret void
+  }
+
+  define void @test_movaddr_optsize(ptr %p, ptr %q) optsize {
+    ret void
+  }
+
+  define void @test_movi64imm_no_optsize(ptr %p, ptr %q) {
+    ret void
+  }
+
+  define void @test_movaddr_no_optsize(ptr %p, ptr %q) {
+    ret void
+  }
+
+  define void @test_movaddr_cross_regclass(ptr %p, ptr %q) optsize {
+    ret void
+  }
+
+  define void @test_movaddr_three_defs(ptr %p, ptr %q, ptr %r) optsize {
+    ret void
+  }
+
+  define void @test_movzxi_same_size_as_copy(ptr %p, ptr %q) optsize {
+    ret void
+  }
+
+  define void @test_movaddr_cross_block(ptr %p, ptr %q) optsize {
+    ret void
+  }
+...
+---
+# Two MOVi64imm with same immediate but different destination registers.
+# With optsize, the second should become a COPY.
+#
+# CHECK-LABEL: name: test_movi64imm_optsize
+# CHECK:      renamable $x8 = MOVi64imm 29273397577910035
+# CHECK-NEXT: STRXui renamable $x8, renamable $x0, 0
+# CHECK-NEXT: renamable $x9 = COPY $x8
+# CHECK-NEXT: STRXui renamable $x9, renamable $x1, 0
+#
+# ZCM-LABEL: name: test_movi64imm_optsize
+# ZCM:      renamable $x8 = MOVi64imm 29273397577910035
+# ZCM-NEXT: STRXui renamable $x8, renamable $x0, 0
+# ZCM-NEXT: renamable $x9 = COPY $x8
+# ZCM-NEXT: STRXui renamable $x9, renamable $x1, 0
+name:            test_movi64imm_optsize
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1
+    renamable $x8 = MOVi64imm 29273397577910035
+    STRXui renamable $x8, renamable $x0, 0 :: (store (s64))
+    renamable $x9 = MOVi64imm 29273397577910035
+    STRXui renamable $x9, renamable $x1, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# Two MOVi64imm with same immediate but different destination registers.
+# The first register ($x8) is clobbered in between, so no coalescing.
+#
+# CHECK-LABEL: name: test_movi64imm_clobbered
+# CHECK:      renamable $x8 = MOVi64imm 29273397577910035
+# CHECK-NEXT: STRXui killed renamable $x8, renamable $x0, 0
+# CHECK-NEXT: renamable $x8 = MOVZXi 0, 0
+# CHECK-NEXT: renamable $x9 = MOVi64imm 29273397577910035
+# CHECK-NEXT: STRXui renamable $x9, renamable $x8, 0
+#
+# ZCM-LABEL: name: test_movi64imm_clobbered
+# ZCM:      renamable $x8 = MOVi64imm 29273397577910035
+# ZCM-NEXT: STRXui killed renamable $x8, renamable $x0, 0
+# ZCM-NEXT: renamable $x8 = MOVZXi 0, 0
+# ZCM-NEXT: renamable $x9 = MOVi64imm 29273397577910035
+# ZCM-NEXT: STRXui renamable $x9, renamable $x8, 0
+name:            test_movi64imm_clobbered
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0
+    renamable $x8 = MOVi64imm 29273397577910035
+    STRXui killed renamable $x8, renamable $x0, 0 :: (store (s64))
+    renamable $x8 = MOVZXi 0, 0
+    renamable $x9 = MOVi64imm 29273397577910035
+    STRXui renamable $x9, renamable $x8, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# Two MOVaddr with same global but different destination registers.
+# With optsize, the second should become a COPY.
+#
+# CHECK-LABEL: name: test_movaddr_optsize
+# CHECK:      renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# CHECK-NEXT: STRXui renamable $x8, renamable $x0, 0
+# CHECK-NEXT: renamable $x9 = COPY $x8
+# CHECK-NEXT: STRXui renamable $x9, renamable $x1, 0
+#
+# ZCM-LABEL: name: test_movaddr_optsize
+# ZCM:      renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# ZCM-NEXT: STRXui renamable $x8, renamable $x0, 0
+# ZCM-NEXT: renamable $x9 = COPY $x8
+# ZCM-NEXT: STRXui renamable $x9, renamable $x1, 0
+name:            test_movaddr_optsize
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1
+    renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x8, renamable $x0, 0 :: (store (s64))
+    renamable $x9 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x9, renamable $x1, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# Without optsize and without zero-cycle moves — should NOT coalesce.
+# With zero-cycle moves — should coalesce even without optsize.
+#
+# CHECK-LABEL: name: test_movi64imm_no_optsize
+# CHECK:      renamable $x8 = MOVi64imm 29273397577910035
+# CHECK-NEXT: STRXui renamable $x8, renamable $x0, 0
+# CHECK-NEXT: renamable $x9 = MOVi64imm 29273397577910035
+# CHECK-NEXT: STRXui renamable $x9, renamable $x1, 0
+#
+# ZCM-LABEL: name: test_movi64imm_no_optsize
+# ZCM:      renamable $x8 = MOVi64imm 29273397577910035
+# ZCM-NEXT: STRXui renamable $x8, renamable $x0, 0
+# ZCM-NEXT: renamable $x9 = COPY $x8
+# ZCM-NEXT: STRXui renamable $x9, renamable $x1, 0
+name:            test_movi64imm_no_optsize
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1
+    renamable $x8 = MOVi64imm 29273397577910035
+    STRXui renamable $x8, renamable $x0, 0 :: (store (s64))
+    renamable $x9 = MOVi64imm 29273397577910035
+    STRXui renamable $x9, renamable $x1, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# Without optsize and without zero-cycle moves — should NOT coalesce.
+# With zero-cycle moves — should coalesce even without optsize.
+#
+# CHECK-LABEL: name: test_movaddr_no_optsize
+# CHECK:      renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# CHECK-NEXT: STRXui renamable $x8, renamable $x0, 0
+# CHECK-NEXT: renamable $x9 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# CHECK-NEXT: STRXui renamable $x9, renamable $x1, 0
+#
+# ZCM-LABEL: name: test_movaddr_no_optsize
+# ZCM:      renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# ZCM-NEXT: STRXui renamable $x8, renamable $x0, 0
+# ZCM-NEXT: renamable $x9 = COPY $x8
+# ZCM-NEXT: STRXui renamable $x9, renamable $x1, 0
+name:            test_movaddr_no_optsize
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1
+    renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x8, renamable $x0, 0 :: (store (s64))
+    renamable $x9 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x9, renamable $x1, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# MOVaddr into callee-saved x20 (GPR64common_and_GPR64noip) then into
+# arg register x0 (GPR64arg). Different minimal register classes but
+# COPY is still valid — should coalesce.
+#
+# CHECK-LABEL: name: test_movaddr_cross_regclass
+# CHECK:      renamable $x20 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# CHECK-NEXT: $x0 = COPY $x20
+# CHECK-NEXT: STRXui renamable $x20, renamable $x0, 0
+#
+# ZCM-LABEL: name: test_movaddr_cross_regclass
+# ZCM:      renamable $x20 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# ZCM-NEXT: $x0 = COPY $x20
+# ZCM-NEXT: STRXui renamable $x20, renamable $x0, 0
+name:            test_movaddr_cross_regclass
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1
+    renamable $x20 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    $x0 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x20, renamable $x0, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# Three MOVaddr with same global but different destination registers.
+# The second and third should become COPYs from the first.
+#
+# CHECK-LABEL: name: test_movaddr_three_defs
+# CHECK:      renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# CHECK-NEXT: STRXui renamable $x8, renamable $x0, 0
+# CHECK-NEXT: renamable $x9 = COPY $x8
+# CHECK-NEXT: STRXui renamable $x9, renamable $x1, 0
+# CHECK-NEXT: renamable $x10 = COPY $x9
+# CHECK-NEXT: STRXui renamable $x10, renamable $x2, 0
+#
+# ZCM-LABEL: name: test_movaddr_three_defs
+# ZCM:      renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# ZCM-NEXT: STRXui renamable $x8, renamable $x0, 0
+# ZCM-NEXT: renamable $x9 = COPY $x8
+# ZCM-NEXT: STRXui renamable $x9, renamable $x1, 0
+# ZCM-NEXT: renamable $x10 = COPY $x9
+# ZCM-NEXT: STRXui renamable $x10, renamable $x2, 0
+name:            test_movaddr_three_defs
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1, $x2
+    renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x8, renamable $x0, 0 :: (store (s64))
+    renamable $x9 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x9, renamable $x1, 0 :: (store (s64))
+    renamable $x10 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x10, renamable $x2, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# MOVZXi is 4 bytes, same as COPY. Without zero-cycle moves, should NOT
+# coalesce because DefSize > CopySize is false (no net size reduction).
+# With zero-cycle moves, should coalesce because the COPY is free.
+#
+# CHECK-LABEL: name: test_movzxi_same_size_as_copy
+# CHECK:      renamable $x8 = MOVZXi 42, 0
+# CHECK-NEXT: STRXui renamable $x8, renamable $x0, 0
+# CHECK-NEXT: renamable $x9 = MOVZXi 42, 0
+# CHECK-NEXT: STRXui renamable $x9, renamable $x1, 0
+#
+# ZCM-LABEL: name: test_movzxi_same_size_as_copy
+# ZCM:      renamable $x8 = MOVZXi 42, 0
+# ZCM-NEXT: STRXui renamable $x8, renamable $x0, 0
+# ZCM-NEXT: renamable $x9 = COPY $x8
+# ZCM-NEXT: STRXui renamable $x9, renamable $x1, 0
+name:            test_movzxi_same_size_as_copy
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1
+    renamable $x8 = MOVZXi 42, 0
+    STRXui renamable $x8, renamable $x0, 0 :: (store (s64))
+    renamable $x9 = MOVZXi 42, 0
+    STRXui renamable $x9, renamable $x1, 0 :: (store (s64))
+    RET_ReallyLR
+...
+---
+# Cross-block: identical MOVaddr in predecessor and successor defining
+# different registers. The predecessor def should be available and the
+# successor def should become a COPY.
+#
+# CHECK-LABEL: name: test_movaddr_cross_block
+# CHECK:      bb.0:
+# CHECK:        renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# CHECK-NEXT:   STRXui renamable $x8, renamable $x0, 0
+# CHECK:      bb.1:
+# CHECK:        renamable $x9 = COPY $x8
+# CHECK-NEXT:   STRXui renamable $x9, renamable $x1, 0
+#
+# ZCM-LABEL: name: test_movaddr_cross_block
+# ZCM:      bb.0:
+# ZCM:        renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+# ZCM-NEXT:   STRXui renamable $x8, renamable $x0, 0
+# ZCM:      bb.1:
+# ZCM:        renamable $x9 = COPY $x8
+# ZCM-NEXT:   STRXui renamable $x9, renamable $x1, 0
+name:            test_movaddr_cross_block
+tracksRegLiveness: true
+body:             |
+  bb.0:
+    liveins: $x0, $x1
+    successors: %bb.1
+    renamable $x8 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x8, renamable $x0, 0 :: (store (s64))
+    B %bb.1
+
+  bb.1:
+    liveins: $x1, $x8
+    renamable $x9 = MOVaddr target-flags(aarch64-page) @g, target-flags(aarch64-pageoff, aarch64-nc) @g
+    STRXui renamable $x9, renamable $x1, 0 :: (store (s64))
+    RET_ReallyLR
+...

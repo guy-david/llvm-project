@@ -160,6 +160,7 @@ public:
   bool enablePostRAScheduler() const override { return usePostRAScheduler(); }
   bool enableSubRegLiveness() const override { return EnableSubregLiveness; }
   bool enableSpillageCopyElimination() const override { return true; }
+  bool isCopyZeroCost(MCRegister DestReg, MCRegister SrcReg) const override;
 
   bool enableMachinePipeliner() const override;
   bool useDFAforSMS() const override { return false; }
