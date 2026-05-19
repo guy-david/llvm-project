@@ -277,6 +277,7 @@ LLVMInitializeAArch64Target() {
   initializeAArch64SLSHardeningLegacyPass(PR);
   initializeAArch64StackTaggingPass(PR);
   initializeAArch64StackTaggingPreRALegacyPass(PR);
+  initializeAArch64CodeGenPrepareLegacyPassPass(PR);
   initializeAArch64LowerHomogeneousPrologEpilogLegacyPass(PR);
   initializeAArch64DAGToDAGISelLegacyPass(PR);
   initializeAArch64CondBrTuningPass(PR);
@@ -649,6 +650,13 @@ void AArch64PassConfig::addIRPasses() {
                                             .needCanonicalLoops(false)
                                             .hoistCommonInsts(true)
                                             .sinkCommonInsts(true)));
+
+  // Pre-widen <N x i1> chains that span block boundaries to their natural
+  // producer width. The DAG type-legalizer commits to a single promoted MVT
+  // for <N x i1> globally and cannot adapt per-producer at a phi <N x i1>.
+  // Run after SimplifyCFG so it doesn't sink the inserted sexts.
+  if (TM->getOptLevel() != CodeGenOptLevel::None)
+    addPass(createAArch64CodeGenPrepareLegacyPass());
 
   // Run LoopDataPrefetch
   //

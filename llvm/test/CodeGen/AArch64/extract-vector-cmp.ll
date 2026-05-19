@@ -75,6 +75,7 @@ define void @vector_loop_with_icmp(ptr nocapture noundef writeonly %dest) {
 ; CHECK-LABEL: vector_loop_with_icmp:
 ; CHECK:       // %bb.0: // %entry
 ; CHECK-NEXT:    index z0.d, #0, #1
+; CHECK-NEXT:    mov z1.d, #15 // =0xf
 ; CHECK-NEXT:    add x8, x0, #4
 ; CHECK-NEXT:    mov w9, #16 // =0x10
 ; CHECK-NEXT:    mov w10, #1 // =0x1
@@ -87,17 +88,16 @@ define void @vector_loop_with_icmp(ptr nocapture noundef writeonly %dest) {
 ; CHECK-NEXT:    b.eq .LBB5_6
 ; CHECK-NEXT:  .LBB5_2: // %vector.body
 ; CHECK-NEXT:    // =>This Inner Loop Header: Depth=1
-; CHECK-NEXT:    fmov x11, d0
-; CHECK-NEXT:    cmp x11, #14
-; CHECK-NEXT:    b.hi .LBB5_4
+; CHECK-NEXT:    cmhi v2.2d, v1.2d, v0.2d
+; CHECK-NEXT:    fmov x11, d2
+; CHECK-NEXT:    tbz x11, #63, .LBB5_4
 ; CHECK-NEXT:  // %bb.3: // %pred.store.if
 ; CHECK-NEXT:    // in Loop: Header=BB5_2 Depth=1
 ; CHECK-NEXT:    stur w10, [x8, #-4]
 ; CHECK-NEXT:  .LBB5_4: // %pred.store.continue
 ; CHECK-NEXT:    // in Loop: Header=BB5_2 Depth=1
-; CHECK-NEXT:    mov x11, v0.d[1]
-; CHECK-NEXT:    cmp x11, #14
-; CHECK-NEXT:    b.hi .LBB5_1
+; CHECK-NEXT:    mov x11, v2.d[1]
+; CHECK-NEXT:    tbz x11, #63, .LBB5_1
 ; CHECK-NEXT:  // %bb.5: // %pred.store.if5
 ; CHECK-NEXT:    // in Loop: Header=BB5_2 Depth=1
 ; CHECK-NEXT:    str w10, [x8]

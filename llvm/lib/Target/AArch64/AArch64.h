@@ -138,6 +138,14 @@ FunctionPass *createAArch64PostSelectOptimize();
 FunctionPass *createAArch64StackTaggingPass(bool IsOptNone);
 FunctionPass *createAArch64StackTaggingPreRALegacyPass();
 ModulePass *createAArch64Arm64ECCallLoweringPass();
+FunctionPass *createAArch64CodeGenPrepareLegacyPass();
+void initializeAArch64CodeGenPrepareLegacyPassPass(PassRegistry &);
+
+class AArch64CodeGenPreparePass
+    : public PassInfoMixin<AArch64CodeGenPreparePass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
+};
 
 void initializeAArch64A53Fix835769LegacyPass(PassRegistry &);
 void initializeAArch64A57FPLoadBalancingLegacyPass(PassRegistry &);
