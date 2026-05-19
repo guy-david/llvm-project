@@ -14003,7 +14003,7 @@ define <2 x i64> @clmulr_v2i64(<2 x i64> %a, <2 x i64> %b) nounwind {
 ; CHECK-NEXT:    lsll r2, r1, #1
 ; CHECK-NEXT:    lsll r4, r7, #1
 ; CHECK-NEXT:    vmov q3[2], q3[0], r4, r2
-; CHECK-NEXT:    movs r4, #0
+; CHECK-NEXT:    mov r3, r5
 ; CHECK-NEXT:    vmov q3[3], q3[1], r7, r1
 ; CHECK-NEXT:    adr.w r1, .LCPI31_65
 ; CHECK-NEXT:    vldrw.u32 q1, [r1]
@@ -14014,6 +14014,7 @@ define <2 x i64> @clmulr_v2i64(<2 x i64> %a, <2 x i64> %b) nounwind {
 ; CHECK-NEXT:    cmp r1, #0
 ; CHECK-NEXT:    mov.w r1, #0
 ; CHECK-NEXT:    csetm r2, eq
+; CHECK-NEXT:    mov r4, r1
 ; CHECK-NEXT:    bfi r4, r2, #0, #8
 ; CHECK-NEXT:    vmov r2, s6
 ; CHECK-NEXT:    vmov.i32 q1, #0x0
@@ -17445,7 +17446,7 @@ define <2 x i64> @clmulh_v2i64(<2 x i64> %a, <2 x i64> %b) nounwind {
 ; CHECK-NEXT:    lsll r2, r1, #1
 ; CHECK-NEXT:    lsll r4, r7, #1
 ; CHECK-NEXT:    vmov q3[2], q3[0], r4, r2
-; CHECK-NEXT:    movs r4, #0
+; CHECK-NEXT:    mov r3, r5
 ; CHECK-NEXT:    vmov q3[3], q3[1], r7, r1
 ; CHECK-NEXT:    adr.w r1, .LCPI39_65
 ; CHECK-NEXT:    vldrw.u32 q1, [r1]
@@ -17456,6 +17457,7 @@ define <2 x i64> @clmulh_v2i64(<2 x i64> %a, <2 x i64> %b) nounwind {
 ; CHECK-NEXT:    cmp r1, #0
 ; CHECK-NEXT:    mov.w r1, #0
 ; CHECK-NEXT:    csetm r2, eq
+; CHECK-NEXT:    mov r4, r1
 ; CHECK-NEXT:    bfi r4, r2, #0, #8
 ; CHECK-NEXT:    vmov r2, s6
 ; CHECK-NEXT:    vmov.i32 q1, #0x0
