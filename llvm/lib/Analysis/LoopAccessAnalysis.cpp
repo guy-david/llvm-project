@@ -124,16 +124,17 @@ const SCEV *llvm::replaceSymbolicStrideSCEV(
   const SCEV *OrigSCEV = PSE.getSCEV(Ptr);
 
   // If there is an entry in the map return the SCEV of the pointer with the
-  // symbolic stride replaced by one.
-  const SCEVUnknown *StrideSCEV = PtrToStride.lookup(Ptr);
-  if (!StrideSCEV)
+  // symbolic stride replaced by the constant it is speculated to equal.
+  auto It = PtrToStride.find(Ptr);
+  if (It == PtrToStride.end())
     // For a non-symbolic stride, just return the original expression.
     return OrigSCEV;
 
+  const SymbolicStride &SS = It->second;
   ScalarEvolution *SE = PSE.getSE();
-  const SCEV *CT = SE->getOne(StrideSCEV->getType());
+  const SCEV *CT = SE->getConstant(SS.Stride->getType(), SS.SpeculatedValue);
   const SCEV *Expr;
-  const SCEVPredicate *EqPred = SE->getEqualPredicate(StrideSCEV, CT);
+  const SCEVPredicate *EqPred = SE->getEqualPredicate(SS.Stride, CT);
   if (Predicates) {
     Predicates->push_back(EqPred);
     Expr = SE->rewriteUsingPredicate(OrigSCEV, Lp,
@@ -3459,7 +3460,8 @@ bool LoopAccessInfo::canAnalyzeLoop() {
 
 bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
                                  const TargetLibraryInfo *TLI,
-                                 DominatorTree *DT) {
+                                 DominatorTree *DT,
+                                 const SpeculatedStrideMap &SpeculatedStrides) {
   // Holds the Load and Store instructions.
   SmallVector<LoadInst *, 16> Loads;
   SmallVector<StoreInst *, 16> Stores;
@@ -3564,7 +3566,7 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
         Loads.push_back(Ld);
         DepChecker->addAccess(Ld);
         if (EnableMemAccessVersioningOfLoop)
-          collectStridedAccess(Ld);
+          collectStridedAccess(Ld, SpeculatedStrides);
         continue;
       }
 
@@ -3587,7 +3589,7 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
         Stores.push_back(St);
         DepChecker->addAccess(St);
         if (EnableMemAccessVersioningOfLoop)
-          collectStridedAccess(St);
+          collectStridedAccess(St, SpeculatedStrides);
       }
     } // Next instr.
   } // Next block.
@@ -3975,7 +3977,8 @@ static const SCEV *getStrideFromPointer(Value *Ptr, ScalarEvolution *SE, Loop *L
   return nullptr;
 }
 
-void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
+void LoopAccessInfo::collectStridedAccess(
+    Value *MemAccess, const SpeculatedStrideMap &SpeculatedStrides) {
   Value *Ptr = getLoadStorePointerOperand(MemAccess);
   if (!Ptr)
     return;
@@ -4004,7 +4007,8 @@ void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
 
   // Avoid adding the "Stride == 1" predicate when we know that
   // Stride >= Trip-Count. Such a predicate will effectively optimize a single
-  // or zero iteration loop, as Trip-Count <= Stride == 1.
+  // or zero iteration loop, as Trip-Count <= Stride == 1. Speculating another
+  // value instead only bounds the trip count by it.
   //
   // TODO: We are currently not making a very informed decision on when it is
   // beneficial to apply stride versioning. It might make more sense that the
@@ -4050,19 +4054,28 @@ void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
     StrideBase = C->getOperand();
   assert(SE->isLoopInvariant(StrideBase, TheLoop) &&
          "users of the map rely on the stride being loop invariant");
-  SymbolicStrides[Ptr] = cast<SCEVUnknown>(StrideBase);
+  const auto *Stride = cast<SCEVUnknown>(StrideBase);
+  SymbolicStrides[Ptr] = {Stride, SpeculatedStrides.lookup_or(Stride, 1)};
 }
 
 LoopAccessInfo::LoopAccessInfo(Loop *L, ScalarEvolution *SE,
                                const TargetTransformInfo *TTI,
                                const TargetLibraryInfo *TLI, AAResults *AA,
                                DominatorTree *DT, LoopInfo *LI,
-                               AssumptionCache *AC, bool AllowPartial)
+                               AssumptionCache *AC, bool AllowPartial,
+                               const SpeculatedStrideMap &SpeculatedStrides)
     : Opts(getAnalysisOptions(*L)),
       PSE(std::make_unique<PredicatedScalarEvolution>(*SE, *L)),
       PtrRtChecking(nullptr), TheLoop(L),
       LoopGuards(ScalarEvolution::LoopGuards::collectOnDemand(L, *SE)),
       AllowPartial(AllowPartial) {
+  assert(all_of(SpeculatedStrides,
+                [](const auto &KV) {
+                  return KV.second &&
+                         isUIntN(KV.first->getType()->getScalarSizeInBits(),
+                                 KV.second);
+                }) &&
+         "speculated values have to be non-zero values of the strides' types");
   unsigned MaxTargetVectorWidthInBits = std::numeric_limits<unsigned>::max();
   if (TTI && !TTI->enableScalableVectorization())
     // Scale the vector width by 2 as rough estimate to also consider
@@ -4075,7 +4088,7 @@ LoopAccessInfo::LoopAccessInfo(Loop *L, ScalarEvolution *SE,
   PtrRtChecking =
       std::make_unique<RuntimePointerChecking>(*DepChecker, SE, LoopGuards);
   if (canAnalyzeLoop())
-    CanVecMem = analyzeLoop(AA, LI, TLI, DT);
+    CanVecMem = analyzeLoop(AA, LI, TLI, DT, SpeculatedStrides);
 }
 
 void LoopAccessInfo::print(raw_ostream &OS, unsigned Depth) const {

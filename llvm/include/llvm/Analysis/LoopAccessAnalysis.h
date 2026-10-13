@@ -60,9 +60,20 @@ struct VectorizerParams {
   LLVM_ABI static bool HoistRuntimeChecks;
 };
 
-/// Maps a pointer to its symbolic (non-constant) stride. Strides are loop
-/// invariant, which collectStridedAccess checks before inserting.
-using SymbolicStrideMap = DenseMap<Value *, const SCEVUnknown *>;
+/// A symbolic (non-constant) stride together with the constant it is speculated
+/// to equal. The stride is loop invariant, which collectStridedAccess checks
+/// before inserting.
+struct SymbolicStride {
+  const SCEVUnknown *Stride = nullptr;
+  uint64_t SpeculatedValue = 1;
+};
+
+/// Maps a pointer to its symbolic (non-constant) stride.
+using SymbolicStrideMap = DenseMap<Value *, SymbolicStride>;
+
+/// Maps a symbolic stride to the constant it should be speculated to equal,
+/// instead of 1.
+using SpeculatedStrideMap = DenseMap<const SCEVUnknown *, uint64_t>;
 
 /// Checks memory dependences among accesses to the same underlying
 /// object to determine whether there vectorization is legal or not (and at
@@ -740,11 +751,16 @@ private:
 /// PSE must be emitted in order for the results of this analysis to be valid.
 class LoopAccessInfo {
 public:
-  LLVM_ABI LoopAccessInfo(Loop *L, ScalarEvolution *SE,
-                          const TargetTransformInfo *TTI,
-                          const TargetLibraryInfo *TLI, AAResults *AA,
-                          DominatorTree *DT, LoopInfo *LI, AssumptionCache *AC,
-                          bool AllowPartial = false);
+  /// Symbolic strides are speculated to equal 1, unless \p SpeculatedStrides
+  /// maps them to another value, which has to be non-zero and fit the stride's
+  /// type as an unsigned value. Its keys are the strides getSymbolicStrides()
+  /// records, and an entry only takes effect for a stride this analysis decides
+  /// to speculate.
+  LLVM_ABI LoopAccessInfo(
+      Loop *L, ScalarEvolution *SE, const TargetTransformInfo *TTI,
+      const TargetLibraryInfo *TLI, AAResults *AA, DominatorTree *DT,
+      LoopInfo *LI, AssumptionCache *AC, bool AllowPartial = false,
+      const SpeculatedStrideMap &SpeculatedStrides = SpeculatedStrideMap());
 
   /// Return true we can analyze the memory accesses in the loop and there are
   /// no memory dependence cycles. Note that for dependences between loads &
@@ -836,7 +852,8 @@ private:
   /// Analyze the loop. Returns true if all memory access in the loop can be
   /// vectorized.
   bool analyzeLoop(AAResults *AA, const LoopInfo *LI,
-                   const TargetLibraryInfo *TLI, DominatorTree *DT);
+                   const TargetLibraryInfo *TLI, DominatorTree *DT,
+                   const SpeculatedStrideMap &SpeculatedStrides);
 
   /// Check if the structure of the loop allows it to be analyzed by this
   /// pass.
@@ -853,8 +870,10 @@ private:
   /// Collect memory access with loop invariant strides.
   ///
   /// Looks for accesses like "a[i * StrideA]" where "StrideA" is loop
-  /// invariant.
-  void collectStridedAccess(Value *LoadOrStoreInst);
+  /// invariant, and speculates "StrideA" to equal its value in
+  /// \p SpeculatedStrides, or 1.
+  void collectStridedAccess(Value *LoadOrStoreInst,
+                            const SpeculatedStrideMap &SpeculatedStrides);
 
   // Emits the first unsafe memory dependence in a loop.
   // Emits nothing if there are no unsafe dependences
@@ -912,8 +931,8 @@ private:
 };
 
 /// Return the SCEV corresponding to a pointer with the symbolic stride
-/// replaced with constant one, assuming the SCEV predicate associated with
-/// \p PSE is true.
+/// replaced with the constant it is speculated to equal, assuming the SCEV
+/// predicate associated with \p PSE is true.
 ///
 /// If necessary this method will version the stride of the pointer according
 /// to \p PtrToStride and therefore add further predicates to \p PSE, except
