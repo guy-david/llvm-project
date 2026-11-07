@@ -60,9 +60,20 @@ struct VectorizerParams {
   LLVM_ABI static bool HoistRuntimeChecks;
 };
 
-/// Maps a pointer to its symbolic (non-constant) stride. Strides are loop
-/// invariant, which collectStridedAccess checks before inserting.
-using SymbolicStrideMap = DenseMap<Value *, const SCEVUnknown *>;
+/// A symbolic (non-constant) stride and the constant it is speculated to
+/// equal. Strides are loop invariant, which collectStridedAccess checks before
+/// inserting.
+struct SymbolicStride {
+  const SCEVUnknown *Stride;
+  const SCEVConstant *SpeculatedValue;
+};
+
+/// Maps a pointer to its symbolic stride.
+using SymbolicStrideMap = DenseMap<Value *, SymbolicStride>;
+
+/// Maps a symbolic stride to the constant of the same type to speculate it to,
+/// instead of one.
+using SpeculatedStrideMap = DenseMap<const SCEVUnknown *, const SCEVConstant *>;
 
 /// Checks memory dependences among accesses to the same underlying
 /// object to determine whether there vectorization is legal or not (and at
@@ -740,11 +751,14 @@ private:
 /// PSE must be emitted in order for the results of this analysis to be valid.
 class LoopAccessInfo {
 public:
+  /// Symbolic strides are speculated to equal one, or the value
+  /// \p SpeculatedStrides maps them to.
   LLVM_ABI LoopAccessInfo(Loop *L, ScalarEvolution *SE,
                           const TargetTransformInfo *TTI,
                           const TargetLibraryInfo *TLI, AAResults *AA,
                           DominatorTree *DT, LoopInfo *LI, AssumptionCache *AC,
-                          bool AllowPartial = false);
+                          bool AllowPartial = false,
+                          SpeculatedStrideMap SpeculatedStrides = {});
 
   /// Return true we can analyze the memory accesses in the loop and there are
   /// no memory dependence cycles. Note that for dependences between loads &
@@ -763,6 +777,11 @@ public:
   /// results, it instead has partial results for those memory accesses that
   /// could be analyzed.
   bool hasAllowPartial() const { return AllowPartial; }
+
+  /// Return the values the symbolic strides were asked to be speculated to.
+  const SpeculatedStrideMap &getSpeculatedStrides() const {
+    return SpeculatedStrides;
+  }
 
   const RuntimePointerChecking *getRuntimePointerChecking() const {
     return PtrRtChecking.get();
@@ -887,6 +906,9 @@ private:
   /// memory accesses could be analyzed.
   bool AllowPartial;
 
+  /// The values to speculate symbolic strides to, instead of one.
+  SpeculatedStrideMap SpeculatedStrides;
+
   /// Cache the result of analyzeLoop.
   bool CanVecMem = false;
   bool HasConvergentOp = false;
@@ -912,8 +934,8 @@ private:
 };
 
 /// Return the SCEV corresponding to a pointer with the symbolic stride
-/// replaced with constant one, assuming the SCEV predicate associated with
-/// \p PSE is true.
+/// replaced with the constant it is speculated to equal, assuming the SCEV
+/// predicate associated with \p PSE is true.
 ///
 /// If necessary this method will version the stride of the pointer according
 /// to \p PtrToStride and therefore add further predicates to \p PSE, except
@@ -1036,7 +1058,9 @@ public:
                         const TargetLibraryInfo *TLI, AssumptionCache *AC)
       : SE(SE), AA(AA), DT(DT), LI(LI), TTI(TTI), TLI(TLI), AC(AC) {}
 
-  LLVM_ABI const LoopAccessInfo &getInfo(Loop &L, bool AllowPartial = false);
+  LLVM_ABI const LoopAccessInfo &
+  getInfo(Loop &L, bool AllowPartial = false,
+          const SpeculatedStrideMap &SpeculatedStrides = {});
 
   LLVM_ABI void clear();
 

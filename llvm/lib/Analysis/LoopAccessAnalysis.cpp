@@ -124,14 +124,14 @@ const SCEV *llvm::replaceSymbolicStrideSCEV(
   const SCEV *OrigSCEV = PSE.getSCEV(Ptr);
 
   // If there is an entry in the map return the SCEV of the pointer with the
-  // symbolic stride replaced by one.
-  const SCEVUnknown *StrideSCEV = PtrToStride.lookup(Ptr);
-  if (!StrideSCEV)
+  // symbolic stride replaced by the constant it is speculated to equal.
+  auto It = PtrToStride.find(Ptr);
+  if (It == PtrToStride.end())
     // For a non-symbolic stride, just return the original expression.
     return OrigSCEV;
 
+  auto [StrideSCEV, CT] = It->second;
   ScalarEvolution *SE = PSE.getSE();
-  const SCEV *CT = SE->getOne(StrideSCEV->getType());
   const SCEV *Expr;
   const SCEVPredicate *EqPred = SE->getEqualPredicate(StrideSCEV, CT);
   if (Predicates) {
@@ -4050,19 +4050,25 @@ void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
     StrideBase = C->getOperand();
   assert(SE->isLoopInvariant(StrideBase, TheLoop) &&
          "users of the map rely on the stride being loop invariant");
-  SymbolicStrides[Ptr] = cast<SCEVUnknown>(StrideBase);
+  const auto *Stride = cast<SCEVUnknown>(StrideBase);
+  const SCEVConstant *Speculated = SpeculatedStrides.lookup(Stride);
+  if (!Speculated)
+    Speculated = cast<SCEVConstant>(SE->getOne(Stride->getType()));
+  SymbolicStrides[Ptr] = {Stride, Speculated};
 }
 
 LoopAccessInfo::LoopAccessInfo(Loop *L, ScalarEvolution *SE,
                                const TargetTransformInfo *TTI,
                                const TargetLibraryInfo *TLI, AAResults *AA,
                                DominatorTree *DT, LoopInfo *LI,
-                               AssumptionCache *AC, bool AllowPartial)
+                               AssumptionCache *AC, bool AllowPartial,
+                               SpeculatedStrideMap SpeculatedStrides)
     : Opts(getAnalysisOptions(*L)),
       PSE(std::make_unique<PredicatedScalarEvolution>(*SE, *L)),
       PtrRtChecking(nullptr), TheLoop(L),
       LoopGuards(ScalarEvolution::LoopGuards::collectOnDemand(L, *SE)),
-      AllowPartial(AllowPartial) {
+      AllowPartial(AllowPartial),
+      SpeculatedStrides(std::move(SpeculatedStrides)) {
   unsigned MaxTargetVectorWidthInBits = std::numeric_limits<unsigned>::max();
   if (TTI && !TTI->enableScalableVectorization())
     // Scale the vector width by 2 as rough estimate to also consider
@@ -4133,15 +4139,18 @@ void LoopAccessInfo::print(raw_ostream &OS, unsigned Depth) const {
   PSE->print(OS, Depth);
 }
 
-const LoopAccessInfo &LoopAccessInfoManager::getInfo(Loop &L,
-                                                     bool AllowPartial) {
+const LoopAccessInfo &
+LoopAccessInfoManager::getInfo(Loop &L, bool AllowPartial,
+                               const SpeculatedStrideMap &SpeculatedStrides) {
   const auto &[It, Inserted] = LoopAccessInfoMap.try_emplace(&L);
 
   // We need to create the LoopAccessInfo if either we don't already have one,
-  // or if it was created with a different value of AllowPartial.
-  if (Inserted || It->second->hasAllowPartial() != AllowPartial)
-    It->second = std::make_unique<LoopAccessInfo>(&L, &SE, TTI, TLI, &AA, &DT,
-                                                  &LI, AC, AllowPartial);
+  // or if it was created with a different value of AllowPartial or
+  // SpeculatedStrides.
+  if (Inserted || It->second->hasAllowPartial() != AllowPartial ||
+      It->second->getSpeculatedStrides() != SpeculatedStrides)
+    It->second = std::make_unique<LoopAccessInfo>(
+        &L, &SE, TTI, TLI, &AA, &DT, &LI, AC, AllowPartial, SpeculatedStrides);
 
   return *It->second;
 }
