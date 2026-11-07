@@ -752,6 +752,9 @@ public:
   /// Returns true if we have any interleave groups.
   bool hasGroups() const { return !InterleaveGroups.empty(); }
 
+  /// Returns true if interleave groups in \p L may have factor \p Factor.
+  LLVM_ABI static bool isAllowedFactor(unsigned Factor, const Loop &L);
+
 private:
   const AnalysisOptions &Opts;
 

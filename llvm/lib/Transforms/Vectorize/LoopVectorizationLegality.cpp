@@ -826,6 +826,69 @@ static bool isTLIScalarize(const TargetLibraryInfo &TLI, const CallInst &CI) {
   return Scalarize;
 }
 
+bool LoopVectorizationLegality::canVectorizeInduction(
+    const InductionDescriptor &ID) {
+  using namespace SCEVPatternMatch;
+  if (!isDisallowedStridedPointerInduction(ID, Opts))
+    return true;
+  const SCEV *Step = ID.getStep();
+  if (const auto *C = dyn_cast<SCEVIntegralCastExpr>(Step))
+    Step = C->getOperand();
+  const auto *Stride = dyn_cast<SCEVUnknown>(Step);
+  if (!Stride)
+    return false;
+
+  // Speculate that the step equals the span of the accesses at constant
+  // offsets off the induction, if they cover it without gaps with elements of
+  // one size, as the members of a full interleave group do.
+  ScalarEvolution &SE = *PSE.getSE();
+  const DataLayout &DL = TheLoop->getHeader()->getDataLayout();
+  const SCEV *Start = SE.getSCEV(ID.getStartValue());
+  SmallSet<uint64_t, 8> Indices;
+  uint64_t MaxIdx = 0;
+  uint64_t Size = 0;
+  for (BasicBlock *BB : TheLoop->blocks()) {
+    for (Instruction &I : *BB) {
+      Value *Ptr = getLoadStorePointerOperand(&I);
+      const SCEV *PtrStart;
+      const APInt *Off;
+      if (!Ptr ||
+          !match(SE.getSCEV(Ptr),
+                 m_scev_AffineAddRec(m_SCEV(PtrStart),
+                                     m_scev_Specific(ID.getStep()),
+                                     m_SpecificLoop(TheLoop))) ||
+          !match(SE.getMinusSCEV(PtrStart, Start), m_scev_APInt(Off)))
+        continue;
+      TypeSize EltSize = DL.getTypeAllocSize(getLoadStoreType(&I));
+      // A negative offset reads as a huge index, which leaves a gap.
+      uint64_t OffVal = Off->getLimitedValue();
+      if (EltSize.isScalable() || EltSize.isZero() ||
+          (Size && EltSize != Size) || OffVal % EltSize.getFixedValue())
+        return false;
+      Size = EltSize.getFixedValue();
+      Indices.insert(OffVal / Size);
+      MaxIdx = std::max(MaxIdx, OffVal / Size);
+    }
+  }
+  if (Indices.size() != MaxIdx + 1 ||
+      !InterleavedAccessInfo::isAllowedFactor(Indices.size(), *TheLoop))
+    return false;
+  // The stride may be sign-extended into the step, so the span has to fit it
+  // as a signed value.
+  uint64_t Span = Indices.size() * Size;
+  if (!isIntN(Stride->getType()->getScalarSizeInBits(), Span))
+    return false;
+  const auto *Speculated =
+      cast<SCEVConstant>(SE.getConstant(Stride->getType(), Span));
+  // Do not speculate a value that the conditions guarding the loop rule out.
+  if (SE.isKnownPredicate(CmpInst::ICMP_NE, SE.applyLoopGuards(Stride, TheLoop),
+                          Speculated))
+    return false;
+  // Inductions sharing a step have to agree on its value.
+  auto [It, Inserted] = SpeculatedStrides.try_emplace(Stride, Speculated);
+  return Inserted || It->second == Speculated;
+}
+
 bool LoopVectorizationLegality::canVectorizeInstrs() {
   bool DoExtraAnalysis = ORE->allowExtraAnalysis(DEBUG_TYPE);
   bool Result = true;
@@ -905,7 +968,7 @@ bool LoopVectorizationLegality::canVectorizeInstr(Instruction &I) {
 
     InductionDescriptor ID;
     if (InductionDescriptor::isInductionPHI(Phi, TheLoop, PSE, ID) &&
-        !isDisallowedStridedPointerInduction(ID, Opts)) {
+        canVectorizeInduction(ID)) {
       addInductionPhi(Phi, ID);
       Requirements->addExactFPMathInst(ID.getExactFPMathInst());
       return true;
@@ -1201,7 +1264,7 @@ bool LoopVectorizationLegality::canVectorizeIndirectUnsafeDependences() {
 }
 
 bool LoopVectorizationLegality::canVectorizeMemory() {
-  LAI = &LAIs.getInfo(*TheLoop);
+  LAI = &LAIs.getInfo(*TheLoop, /*AllowPartial=*/false, SpeculatedStrides);
   const OptimizationRemarkAnalysis *LAR = LAI->getReport();
   if (LAR) {
     ORE->emit([&]() {

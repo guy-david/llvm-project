@@ -1339,6 +1339,11 @@ bool InterleavedAccessInfo::isStrided(int Stride) const {
   return Factor >= 2 && Factor <= Opts.max_interleave_group_factor;
 }
 
+bool InterleavedAccessInfo::isAllowedFactor(unsigned Factor, const Loop &L) {
+  return Factor >= 2 &&
+         Factor <= getAnalysisOptions(L).max_interleave_group_factor;
+}
+
 void InterleavedAccessInfo::collectConstStrideAccesses(
     MapVector<Instruction *, StrideDescriptor> &AccessStrideInfo,
     const SymbolicStrideMap &Strides,
