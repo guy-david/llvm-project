@@ -60,9 +60,16 @@ struct VectorizerParams {
   LLVM_ABI static bool HoistRuntimeChecks;
 };
 
-/// Maps a pointer to its symbolic (non-constant) stride. Strides are loop
-/// invariant, which collectStridedAccess checks before inserting.
-using SymbolicStrideMap = DenseMap<Value *, const SCEVUnknown *>;
+/// A symbolic (non-constant) stride and the constant it is speculated to
+/// equal. Strides are loop invariant, which collectStridedAccess checks before
+/// inserting.
+struct SymbolicStride {
+  const SCEVUnknown *Stride;
+  const SCEVConstant *SpeculatedValue;
+};
+
+/// Maps a pointer to its symbolic stride.
+using SymbolicStrideMap = DenseMap<Value *, SymbolicStride>;
 
 /// Checks memory dependences among accesses to the same underlying
 /// object to determine whether there vectorization is legal or not (and at
@@ -740,11 +747,16 @@ private:
 /// PSE must be emitted in order for the results of this analysis to be valid.
 class LoopAccessInfo {
 public:
+  /// Symbolic strides are speculated to equal one. If
+  /// \p SpeculateInterleavedStrides is true, the non-constant step of a pointer
+  /// induction is instead speculated to equal the span of the accesses off it,
+  /// if they may form an interleave group.
   LLVM_ABI LoopAccessInfo(Loop *L, ScalarEvolution *SE,
                           const TargetTransformInfo *TTI,
                           const TargetLibraryInfo *TLI, AAResults *AA,
                           DominatorTree *DT, LoopInfo *LI, AssumptionCache *AC,
-                          bool AllowPartial = false);
+                          bool AllowPartial = false,
+                          bool SpeculateInterleavedStrides = false);
 
   /// Return true we can analyze the memory accesses in the loop and there are
   /// no memory dependence cycles. Note that for dependences between loads &
@@ -763,6 +775,12 @@ public:
   /// results, it instead has partial results for those memory accesses that
   /// could be analyzed.
   bool hasAllowPartial() const { return AllowPartial; }
+
+  /// Return true if the steps of pointer inductions may be speculated to the
+  /// span of an interleave group.
+  bool speculatesInterleavedStrides() const {
+    return SpeculateInterleavedStrides;
+  }
 
   const RuntimePointerChecking *getRuntimePointerChecking() const {
     return PtrRtChecking.get();
@@ -856,6 +874,12 @@ private:
   /// invariant.
   void collectStridedAccess(Value *LoadOrStoreInst);
 
+  /// Fill SpeculatedStrides with the span of the accesses at constant offsets
+  /// off each pointer induction with a non-constant step, if they cover it
+  /// without gaps with elements of one size, as the members of a full
+  /// interleave group do.
+  void collectInterleavedStrides();
+
   // Emits the first unsafe memory dependence in a loop.
   // Emits nothing if there are no unsafe dependences
   // or if the dependences were not recorded.
@@ -887,6 +911,13 @@ private:
   /// memory accesses could be analyzed.
   bool AllowPartial;
 
+  /// Determines whether the steps of pointer inductions may be speculated to
+  /// the span of an interleave group.
+  bool SpeculateInterleavedStrides;
+
+  /// The values to speculate symbolic strides to, instead of one if null.
+  DenseMap<const SCEVUnknown *, const SCEVConstant *> SpeculatedStrides;
+
   /// Cache the result of analyzeLoop.
   bool CanVecMem = false;
   bool HasConvergentOp = false;
@@ -912,8 +943,8 @@ private:
 };
 
 /// Return the SCEV corresponding to a pointer with the symbolic stride
-/// replaced with constant one, assuming the SCEV predicate associated with
-/// \p PSE is true.
+/// replaced with the constant it is speculated to equal, assuming the SCEV
+/// predicate associated with \p PSE is true.
 ///
 /// If necessary this method will version the stride of the pointer according
 /// to \p PtrToStride and therefore add further predicates to \p PSE, except
@@ -1036,7 +1067,9 @@ public:
                         const TargetLibraryInfo *TLI, AssumptionCache *AC)
       : SE(SE), AA(AA), DT(DT), LI(LI), TTI(TTI), TLI(TLI), AC(AC) {}
 
-  LLVM_ABI const LoopAccessInfo &getInfo(Loop &L, bool AllowPartial = false);
+  LLVM_ABI const LoopAccessInfo &
+  getInfo(Loop &L, bool AllowPartial = false,
+          bool SpeculateInterleavedStrides = false);
 
   LLVM_ABI void clear();
 

@@ -124,14 +124,14 @@ const SCEV *llvm::replaceSymbolicStrideSCEV(
   const SCEV *OrigSCEV = PSE.getSCEV(Ptr);
 
   // If there is an entry in the map return the SCEV of the pointer with the
-  // symbolic stride replaced by one.
-  const SCEVUnknown *StrideSCEV = PtrToStride.lookup(Ptr);
-  if (!StrideSCEV)
+  // symbolic stride replaced by the constant it is speculated to equal.
+  auto It = PtrToStride.find(Ptr);
+  if (It == PtrToStride.end())
     // For a non-symbolic stride, just return the original expression.
     return OrigSCEV;
 
+  auto [StrideSCEV, CT] = It->second;
   ScalarEvolution *SE = PSE.getSE();
-  const SCEV *CT = SE->getOne(StrideSCEV->getType());
   const SCEV *Expr;
   const SCEVPredicate *EqPred = SE->getEqualPredicate(StrideSCEV, CT);
   if (Predicates) {
@@ -3482,6 +3482,8 @@ bool LoopAccessInfo::analyzeLoop(AAResults *AA, const LoopInfo *LI,
   const bool EnableMemAccessVersioningOfLoop =
       Opts.enable_mem_access_versioning &&
       !TheLoop->getHeader()->getParent()->hasOptSize();
+  if (EnableMemAccessVersioningOfLoop && SpeculateInterleavedStrides)
+    collectInterleavedStrides();
 
   // Traverse blocks in fixed RPOT order, regardless of their storage in the
   // loop info, as it may be arbitrary.
@@ -3975,6 +3977,79 @@ static const SCEV *getStrideFromPointer(Value *Ptr, ScalarEvolution *SE, Loop *L
   return nullptr;
 }
 
+/// Returns the span of the accesses at constant offsets off the pointer
+/// induction {\p Start,+,\p Step} in \p L, if they cover it without gaps with
+/// between 2 and \p MaxFactor elements of one size, or 0 otherwise.
+static uint64_t getInterleavedSpan(const Loop *L, ScalarEvolution &SE,
+                                   const SCEV *Start, const SCEV *Step,
+                                   unsigned MaxFactor) {
+  const DataLayout &DL = L->getHeader()->getDataLayout();
+  SmallSet<uint64_t, 8> Indices;
+  uint64_t MaxIdx = 0;
+  uint64_t Size = 0;
+  for (BasicBlock *BB : L->blocks()) {
+    for (Instruction &I : *BB) {
+      Value *Ptr = getLoadStorePointerOperand(&I);
+      const SCEV *PtrStart;
+      const APInt *Off;
+      if (!Ptr ||
+          !match(SE.getSCEV(Ptr),
+                 m_scev_AffineAddRec(m_SCEV(PtrStart), m_scev_Specific(Step),
+                                     m_SpecificLoop(L))) ||
+          !match(SE.getMinusSCEV(PtrStart, Start), m_scev_APInt(Off)))
+        continue;
+      TypeSize EltSize = DL.getTypeAllocSize(getLoadStoreType(&I));
+      // A negative offset reads as a huge index, which leaves a gap.
+      uint64_t OffVal = Off->getLimitedValue();
+      if (EltSize.isScalable() || EltSize.isZero() ||
+          (Size && EltSize != Size) || OffVal % EltSize.getFixedValue())
+        return 0;
+      Size = EltSize.getFixedValue();
+      Indices.insert(OffVal / Size);
+      MaxIdx = std::max(MaxIdx, OffVal / Size);
+    }
+  }
+  if (Indices.size() != MaxIdx + 1 || Indices.size() < 2 ||
+      Indices.size() > MaxFactor)
+    return 0;
+  return Indices.size() * Size;
+}
+
+void LoopAccessInfo::collectInterleavedStrides() {
+  ScalarEvolution *SE = PSE->getSE();
+  for (PHINode &Phi : TheLoop->getHeader()->phis()) {
+    const SCEV *Start, *Step;
+    if (!Phi.getType()->isPointerTy() ||
+        !match(SE->getSCEV(&Phi),
+               m_scev_AffineAddRec(m_SCEV(Start), m_SCEV(Step),
+                                   m_SpecificLoop(TheLoop))))
+      continue;
+    const SCEV *StrideBase = Step;
+    if (const auto *C = dyn_cast<SCEVIntegralCastExpr>(StrideBase))
+      StrideBase = C->getOperand();
+    const auto *Stride = dyn_cast<SCEVUnknown>(StrideBase);
+    if (!Stride)
+      continue;
+    // The stride may be sign-extended into the step, so the span has to fit it
+    // as a signed value. Do not speculate a value that the conditions guarding
+    // the loop rule out.
+    uint64_t Span = getInterleavedSpan(TheLoop, *SE, Start, Step,
+                                       Opts.max_interleave_group_factor);
+    const SCEVConstant *Speculated = nullptr;
+    if (Span && isIntN(Stride->getType()->getScalarSizeInBits(), Span)) {
+      Speculated = cast<SCEVConstant>(SE->getConstant(Stride->getType(), Span));
+      if (SE->isKnownPredicate(CmpInst::ICMP_NE,
+                               SE->applyLoopGuards(Stride, LoopGuards),
+                               Speculated))
+        Speculated = nullptr;
+    }
+    // Inductions sharing a step have to agree on its value.
+    auto [It, Inserted] = SpeculatedStrides.try_emplace(Stride, Speculated);
+    if (!Inserted && It->second != Speculated)
+      It->second = nullptr;
+  }
+}
+
 void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
   Value *Ptr = getLoadStorePointerOperand(MemAccess);
   if (!Ptr)
@@ -4050,19 +4125,25 @@ void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
     StrideBase = C->getOperand();
   assert(SE->isLoopInvariant(StrideBase, TheLoop) &&
          "users of the map rely on the stride being loop invariant");
-  SymbolicStrides[Ptr] = cast<SCEVUnknown>(StrideBase);
+  const auto *Stride = cast<SCEVUnknown>(StrideBase);
+  const SCEVConstant *Speculated = SpeculatedStrides.lookup(Stride);
+  if (!Speculated)
+    Speculated = cast<SCEVConstant>(SE->getOne(Stride->getType()));
+  SymbolicStrides[Ptr] = {Stride, Speculated};
 }
 
 LoopAccessInfo::LoopAccessInfo(Loop *L, ScalarEvolution *SE,
                                const TargetTransformInfo *TTI,
                                const TargetLibraryInfo *TLI, AAResults *AA,
                                DominatorTree *DT, LoopInfo *LI,
-                               AssumptionCache *AC, bool AllowPartial)
+                               AssumptionCache *AC, bool AllowPartial,
+                               bool SpeculateInterleavedStrides)
     : Opts(getAnalysisOptions(*L)),
       PSE(std::make_unique<PredicatedScalarEvolution>(*SE, *L)),
       PtrRtChecking(nullptr), TheLoop(L),
       LoopGuards(ScalarEvolution::LoopGuards::collectOnDemand(L, *SE)),
-      AllowPartial(AllowPartial) {
+      AllowPartial(AllowPartial),
+      SpeculateInterleavedStrides(SpeculateInterleavedStrides) {
   unsigned MaxTargetVectorWidthInBits = std::numeric_limits<unsigned>::max();
   if (TTI && !TTI->enableScalableVectorization())
     // Scale the vector width by 2 as rough estimate to also consider
@@ -4133,15 +4214,19 @@ void LoopAccessInfo::print(raw_ostream &OS, unsigned Depth) const {
   PSE->print(OS, Depth);
 }
 
-const LoopAccessInfo &LoopAccessInfoManager::getInfo(Loop &L,
-                                                     bool AllowPartial) {
+const LoopAccessInfo &
+LoopAccessInfoManager::getInfo(Loop &L, bool AllowPartial,
+                               bool SpeculateInterleavedStrides) {
   const auto &[It, Inserted] = LoopAccessInfoMap.try_emplace(&L);
 
   // We need to create the LoopAccessInfo if either we don't already have one,
-  // or if it was created with a different value of AllowPartial.
-  if (Inserted || It->second->hasAllowPartial() != AllowPartial)
+  // or if it was created with a different value of AllowPartial or
+  // SpeculateInterleavedStrides.
+  if (Inserted || It->second->hasAllowPartial() != AllowPartial ||
+      It->second->speculatesInterleavedStrides() != SpeculateInterleavedStrides)
     It->second = std::make_unique<LoopAccessInfo>(&L, &SE, TTI, TLI, &AA, &DT,
-                                                  &LI, AC, AllowPartial);
+                                                  &LI, AC, AllowPartial,
+                                                  SpeculateInterleavedStrides);
 
   return *It->second;
 }
