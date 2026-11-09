@@ -423,6 +423,13 @@ public:
 
   const LoopAccessInfo *getLAI() const { return LAI; }
 
+  /// Returns the non-constant steps of pointer inductions, which the loop
+  /// access analysis speculated. The accesses using such a step have to be
+  /// vectorized as interleave groups.
+  const SmallPtrSetImpl<const SCEVUnknown *> &getSpeculatedStrides() const {
+    return SpeculatedStrides;
+  }
+
   bool isSafeForAnyVectorWidth() const {
     return LAI->getDepChecker().isSafeForAnyVectorWidth() &&
            LAI->getDepChecker().isSafeForAnyStoreLoadForwardDistances();
@@ -570,6 +577,11 @@ private:
 
   /// Check if an individual instruction is vectorizable.
   bool canVectorizeInstr(Instruction &I);
+
+  /// Check if the induction \p ID is vectorizable. The step of a pointer
+  /// induction with a non-constant step is added to SpeculatedStrides, and
+  /// canVectorizeMemory checks that the loop access analysis speculated it.
+  bool canVectorizeInduction(const InductionDescriptor &ID);
 
   /// When we vectorize loops we may change the order in which
   /// we read and write from memory. This method checks if it is
@@ -725,6 +737,9 @@ private:
   LoopAccessInfoManager &LAIs;
 
   const LoopAccessInfo *LAI = nullptr;
+
+  /// The non-constant steps of pointer inductions.
+  SmallPtrSet<const SCEVUnknown *, 2> SpeculatedStrides;
 
   /// Interface to emit optimization remarks.
   OptimizationRemarkEmitter *ORE;

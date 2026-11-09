@@ -293,7 +293,7 @@ exit:
 }
 
 ; CHECK-LABEL: Function: load_and_store{{$}}
-; CHECK:         - String: pointer induction with a non-constant step could not be vectorized
+; CHECK:         - String: accesses with a speculated stride are not vectorized as interleave groups
 define void @load_and_store(ptr %s, i64 %n, i64 %st) {
 entry:
   br label %loop
@@ -313,7 +313,7 @@ exit:
 }
 
 ; CHECK-LABEL: Function: dependence_inside_group{{$}}
-; CHECK:         - String: pointer induction with a non-constant step could not be vectorized
+; CHECK:         - String: accesses with a speculated stride are not vectorized as interleave groups
 define void @dependence_inside_group(ptr %s, i64 %n, i64 %st) {
 entry:
   br label %loop
@@ -337,7 +337,7 @@ exit:
 }
 
 ; CHECK-LABEL: Function: tail_folded{{$}}
-; CHECK:         - String: pointer induction with a non-constant step could not be vectorized
+; CHECK:         - String: accesses with a speculated stride are not vectorized as interleave groups
 define void @tail_folded(ptr noalias %d, ptr noalias %s, i64 %n, i64 %st) {
 entry:
   br label %loop
@@ -362,13 +362,13 @@ exit:
 }
 
 ; CHECK-LABEL: Function: interleave_only{{$}}
-; CHECK:         - String: pointer induction with a non-constant step could not be vectorized
+; CHECK:       Name: Vectorized
 ; VF1-LABEL: Function: interleave_only{{$}}
-; VF1:         - String: pointer induction with a non-constant step could not be vectorized
+; VF1:         - String: accesses with a speculated stride are not vectorized as interleave groups
 ; MAXF2-LABEL: Function: interleave_only{{$}}
 ; MAXF2:         - String: pointer induction with a non-constant step could not be vectorized
 ; MAXF3-LABEL: Function: interleave_only{{$}}
-; MAXF3:         - String: pointer induction with a non-constant step could not be vectorized
+; MAXF3:       Name: Vectorized
 define void @interleave_only(ptr noalias %d, ptr noalias %s, i64 %n, i64 %st) {
 entry:
   br label %loop

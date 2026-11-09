@@ -826,6 +826,20 @@ static bool isTLIScalarize(const TargetLibraryInfo &TLI, const CallInst &CI) {
   return Scalarize;
 }
 
+bool LoopVectorizationLegality::canVectorizeInduction(
+    const InductionDescriptor &ID) {
+  if (!isDisallowedStridedPointerInduction(ID, Opts))
+    return true;
+  const SCEV *Step = ID.getStep();
+  if (const auto *C = dyn_cast<SCEVIntegralCastExpr>(Step))
+    Step = C->getOperand();
+  const auto *Stride = dyn_cast<SCEVUnknown>(Step);
+  if (!Stride)
+    return false;
+  SpeculatedStrides.insert(Stride);
+  return true;
+}
+
 bool LoopVectorizationLegality::canVectorizeInstrs() {
   bool DoExtraAnalysis = ORE->allowExtraAnalysis(DEBUG_TYPE);
   bool Result = true;
@@ -905,7 +919,7 @@ bool LoopVectorizationLegality::canVectorizeInstr(Instruction &I) {
 
     InductionDescriptor ID;
     if (InductionDescriptor::isInductionPHI(Phi, TheLoop, PSE, ID) &&
-        !isDisallowedStridedPointerInduction(ID, Opts)) {
+        canVectorizeInduction(ID)) {
       addInductionPhi(Phi, ID);
       Requirements->addExactFPMathInst(ID.getExactFPMathInst());
       return true;
@@ -1201,7 +1215,24 @@ bool LoopVectorizationLegality::canVectorizeIndirectUnsafeDependences() {
 }
 
 bool LoopVectorizationLegality::canVectorizeMemory() {
-  LAI = &LAIs.getInfo(*TheLoop);
+  LAI =
+      &LAIs.getInfo(*TheLoop, /*AllowPartial=*/false,
+                    /*SpeculateInterleavedStrides=*/!SpeculatedStrides.empty());
+  // The step of a pointer induction with a non-constant step is only
+  // vectorizable if the analysis speculated it to the span of an interleave
+  // group.
+  for (const SCEVUnknown *Stride : SpeculatedStrides) {
+    if (none_of(make_second_range(LAI->getSymbolicStrides()),
+                [&](const SymbolicStride &S) {
+                  return S.Stride == Stride && !S.SpeculatedValue->isOne();
+                })) {
+      reportVectorizationFailure("Found a disallowed pointer induction",
+                                 "pointer induction with a non-constant step "
+                                 "could not be vectorized",
+                                 "StridedPointerInduction", ORE, TheLoop);
+      return false;
+    }
+  }
   const OptimizationRemarkAnalysis *LAR = LAI->getReport();
   if (LAR) {
     ORE->emit([&]() {

@@ -8,34 +8,118 @@ define void @epilogue(ptr noalias %d, ptr noalias %s, i64 %n, i64 %st) {
 ;
 ; EPI4-LABEL: define void @epilogue(
 ; EPI4-SAME: ptr noalias [[D:%.*]], ptr noalias [[S:%.*]], i64 [[N:%.*]], i64 [[ST:%.*]]) {
-; EPI4-NEXT:  [[ENTRY:.*]]:
-; EPI4-NEXT:    br label %[[LOOP:.*]]
-; EPI4:       [[LOOP]]:
-; EPI4-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I_NEXT:%.*]], %[[LOOP]] ]
-; EPI4-NEXT:    [[P:%.*]] = phi ptr [ [[S]], %[[ENTRY]] ], [ [[P_NEXT:%.*]], %[[LOOP]] ]
-; EPI4-NEXT:    [[P1:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 1
-; EPI4-NEXT:    [[P2:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 2
-; EPI4-NEXT:    [[X:%.*]] = load i8, ptr [[P]], align 1
-; EPI4-NEXT:    [[Y:%.*]] = load i8, ptr [[P1]], align 1
-; EPI4-NEXT:    [[Z:%.*]] = load i8, ptr [[P2]], align 1
-; EPI4-NEXT:    [[A:%.*]] = add i8 [[X]], [[Y]]
-; EPI4-NEXT:    [[B:%.*]] = add i8 [[A]], [[Z]]
-; EPI4-NEXT:    [[Q:%.*]] = getelementptr inbounds i8, ptr [[D]], i64 [[I]]
-; EPI4-NEXT:    store i8 [[B]], ptr [[Q]], align 1
-; EPI4-NEXT:    [[P_NEXT]] = getelementptr inbounds i8, ptr [[P]], i64 [[ST]]
-; EPI4-NEXT:    [[I_NEXT]] = add i64 [[I]], 1
-; EPI4-NEXT:    [[EC:%.*]] = icmp eq i64 [[I_NEXT]], [[N]]
-; EPI4-NEXT:    br i1 [[EC]], label %[[EXIT:.*]], label %[[LOOP]]
-; EPI4:       [[EXIT]]:
-; EPI4-NEXT:    ret void
+; EPI4-NEXT:  [[ENTRY:.*:]]
+; EPI4-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i64 [[N]], 16
+; EPI4-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[SCALAR_PH:.*]], label %[[VECTOR_SCEVCHECK:.*]]
+; EPI4:       [[VECTOR_SCEVCHECK]]:
+; EPI4-NEXT:    [[IDENT_CHECK:%.*]] = icmp ne i64 [[ST]], 3
+; EPI4-NEXT:    br i1 [[IDENT_CHECK]], label %[[SCALAR_PH]], label %[[VECTOR_PH:.*]]
+; EPI4:       [[VECTOR_PH]]:
+; EPI4-NEXT:    [[TMP0:%.*]] = and i64 [[N]], 15
+; EPI4-NEXT:    [[N_VEC:%.*]] = sub i64 [[N]], [[TMP0]]
+; EPI4-NEXT:    [[TMP1:%.*]] = mul i64 [[N_VEC]], 3
+; EPI4-NEXT:    [[TMP2:%.*]] = getelementptr i8, ptr [[S]], i64 [[TMP1]]
+; EPI4-NEXT:    br label %[[VECTOR_BODY:.*]]
+; EPI4:       [[VECTOR_BODY]]:
+; EPI4-NEXT:    [[INDEX:%.*]] = phi i64 [ 0, %[[VECTOR_PH]] ], [ [[INDEX_NEXT:%.*]], %[[VECTOR_BODY]] ]
+; EPI4-NEXT:    [[TMP3:%.*]] = mul i64 [[INDEX]], 3
+; EPI4-NEXT:    [[NEXT_GEP:%.*]] = getelementptr i8, ptr [[S]], i64 [[TMP3]]
+; EPI4-NEXT:    [[WIDE_VEC:%.*]] = load <48 x i8>, ptr [[NEXT_GEP]], align 1
+; EPI4-NEXT:    [[STRIDED_VEC:%.*]] = shufflevector <48 x i8> [[WIDE_VEC]], <48 x i8> poison, <16 x i32> <i32 0, i32 3, i32 6, i32 9, i32 12, i32 15, i32 18, i32 21, i32 24, i32 27, i32 30, i32 33, i32 36, i32 39, i32 42, i32 45>
+; EPI4-NEXT:    [[STRIDED_VEC1:%.*]] = shufflevector <48 x i8> [[WIDE_VEC]], <48 x i8> poison, <16 x i32> <i32 1, i32 4, i32 7, i32 10, i32 13, i32 16, i32 19, i32 22, i32 25, i32 28, i32 31, i32 34, i32 37, i32 40, i32 43, i32 46>
+; EPI4-NEXT:    [[STRIDED_VEC2:%.*]] = shufflevector <48 x i8> [[WIDE_VEC]], <48 x i8> poison, <16 x i32> <i32 2, i32 5, i32 8, i32 11, i32 14, i32 17, i32 20, i32 23, i32 26, i32 29, i32 32, i32 35, i32 38, i32 41, i32 44, i32 47>
+; EPI4-NEXT:    [[TMP4:%.*]] = add <16 x i8> [[STRIDED_VEC]], [[STRIDED_VEC1]]
+; EPI4-NEXT:    [[TMP5:%.*]] = add <16 x i8> [[TMP4]], [[STRIDED_VEC2]]
+; EPI4-NEXT:    [[TMP6:%.*]] = getelementptr inbounds i8, ptr [[D]], i64 [[INDEX]]
+; EPI4-NEXT:    store <16 x i8> [[TMP5]], ptr [[TMP6]], align 1
+; EPI4-NEXT:    [[INDEX_NEXT]] = add nuw i64 [[INDEX]], 16
+; EPI4-NEXT:    [[TMP7:%.*]] = icmp eq i64 [[INDEX_NEXT]], [[N_VEC]]
+; EPI4-NEXT:    br i1 [[TMP7]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !llvm.loop [[LOOP0:![0-9]+]]
+; EPI4:       [[MIDDLE_BLOCK]]:
+; EPI4-NEXT:    [[CMP_N:%.*]] = icmp eq i64 [[N]], [[N_VEC]]
+; EPI4-NEXT:    br i1 [[CMP_N]], [[EXIT:label %.*]], label %[[SCALAR_PH]]
+; EPI4:       [[SCALAR_PH]]:
 ;
 ; DEFAULT-LABEL: define void @epilogue(
 ; DEFAULT-SAME: ptr noalias [[D:%.*]], ptr noalias [[S:%.*]], i64 [[N:%.*]], i64 [[ST:%.*]]) {
-; DEFAULT-NEXT:  [[ENTRY:.*]]:
+; DEFAULT-NEXT:  [[ITER_CHECK:.*]]:
+; DEFAULT-NEXT:    [[MIN_ITERS_CHECK:%.*]] = icmp ult i64 [[N]], 8
+; DEFAULT-NEXT:    br i1 [[MIN_ITERS_CHECK]], label %[[VEC_EPILOG_SCALAR_PH:.*]], label %[[VECTOR_SCEVCHECK:.*]]
+; DEFAULT:       [[VECTOR_SCEVCHECK]]:
+; DEFAULT-NEXT:    [[IDENT_CHECK:%.*]] = icmp ne i64 [[ST]], 3
+; DEFAULT-NEXT:    br i1 [[IDENT_CHECK]], label %[[VEC_EPILOG_SCALAR_PH]], label %[[VECTOR_MAIN_LOOP_ITER_CHECK:.*]]
+; DEFAULT:       [[VECTOR_MAIN_LOOP_ITER_CHECK]]:
+; DEFAULT-NEXT:    [[MIN_ITERS_CHECK1:%.*]] = icmp ult i64 [[N]], 32
+; DEFAULT-NEXT:    br i1 [[MIN_ITERS_CHECK1]], label %[[VEC_EPILOG_PH:.*]], label %[[VECTOR_PH:.*]]
+; DEFAULT:       [[VECTOR_PH]]:
+; DEFAULT-NEXT:    [[TMP0:%.*]] = and i64 [[N]], 31
+; DEFAULT-NEXT:    [[N_VEC:%.*]] = sub i64 [[N]], [[TMP0]]
+; DEFAULT-NEXT:    [[TMP1:%.*]] = mul i64 [[N_VEC]], 3
+; DEFAULT-NEXT:    [[TMP2:%.*]] = getelementptr i8, ptr [[S]], i64 [[TMP1]]
+; DEFAULT-NEXT:    br label %[[VECTOR_BODY:.*]]
+; DEFAULT:       [[VECTOR_BODY]]:
+; DEFAULT-NEXT:    [[INDEX:%.*]] = phi i64 [ 0, %[[VECTOR_PH]] ], [ [[INDEX_NEXT:%.*]], %[[VECTOR_BODY]] ]
+; DEFAULT-NEXT:    [[TMP3:%.*]] = mul i64 [[INDEX]], 3
+; DEFAULT-NEXT:    [[TMP4:%.*]] = add i64 [[TMP3]], 48
+; DEFAULT-NEXT:    [[NEXT_GEP:%.*]] = getelementptr i8, ptr [[S]], i64 [[TMP3]]
+; DEFAULT-NEXT:    [[NEXT_GEP2:%.*]] = getelementptr i8, ptr [[S]], i64 [[TMP4]]
+; DEFAULT-NEXT:    [[WIDE_VEC:%.*]] = load <48 x i8>, ptr [[NEXT_GEP]], align 1
+; DEFAULT-NEXT:    [[STRIDED_VEC:%.*]] = shufflevector <48 x i8> [[WIDE_VEC]], <48 x i8> poison, <16 x i32> <i32 0, i32 3, i32 6, i32 9, i32 12, i32 15, i32 18, i32 21, i32 24, i32 27, i32 30, i32 33, i32 36, i32 39, i32 42, i32 45>
+; DEFAULT-NEXT:    [[STRIDED_VEC3:%.*]] = shufflevector <48 x i8> [[WIDE_VEC]], <48 x i8> poison, <16 x i32> <i32 1, i32 4, i32 7, i32 10, i32 13, i32 16, i32 19, i32 22, i32 25, i32 28, i32 31, i32 34, i32 37, i32 40, i32 43, i32 46>
+; DEFAULT-NEXT:    [[STRIDED_VEC4:%.*]] = shufflevector <48 x i8> [[WIDE_VEC]], <48 x i8> poison, <16 x i32> <i32 2, i32 5, i32 8, i32 11, i32 14, i32 17, i32 20, i32 23, i32 26, i32 29, i32 32, i32 35, i32 38, i32 41, i32 44, i32 47>
+; DEFAULT-NEXT:    [[WIDE_VEC5:%.*]] = load <48 x i8>, ptr [[NEXT_GEP2]], align 1
+; DEFAULT-NEXT:    [[STRIDED_VEC6:%.*]] = shufflevector <48 x i8> [[WIDE_VEC5]], <48 x i8> poison, <16 x i32> <i32 0, i32 3, i32 6, i32 9, i32 12, i32 15, i32 18, i32 21, i32 24, i32 27, i32 30, i32 33, i32 36, i32 39, i32 42, i32 45>
+; DEFAULT-NEXT:    [[STRIDED_VEC7:%.*]] = shufflevector <48 x i8> [[WIDE_VEC5]], <48 x i8> poison, <16 x i32> <i32 1, i32 4, i32 7, i32 10, i32 13, i32 16, i32 19, i32 22, i32 25, i32 28, i32 31, i32 34, i32 37, i32 40, i32 43, i32 46>
+; DEFAULT-NEXT:    [[STRIDED_VEC8:%.*]] = shufflevector <48 x i8> [[WIDE_VEC5]], <48 x i8> poison, <16 x i32> <i32 2, i32 5, i32 8, i32 11, i32 14, i32 17, i32 20, i32 23, i32 26, i32 29, i32 32, i32 35, i32 38, i32 41, i32 44, i32 47>
+; DEFAULT-NEXT:    [[TMP5:%.*]] = add <16 x i8> [[STRIDED_VEC]], [[STRIDED_VEC3]]
+; DEFAULT-NEXT:    [[TMP6:%.*]] = add <16 x i8> [[STRIDED_VEC6]], [[STRIDED_VEC7]]
+; DEFAULT-NEXT:    [[TMP7:%.*]] = add <16 x i8> [[TMP5]], [[STRIDED_VEC4]]
+; DEFAULT-NEXT:    [[TMP8:%.*]] = add <16 x i8> [[TMP6]], [[STRIDED_VEC8]]
+; DEFAULT-NEXT:    [[TMP9:%.*]] = getelementptr inbounds i8, ptr [[D]], i64 [[INDEX]]
+; DEFAULT-NEXT:    [[TMP10:%.*]] = getelementptr inbounds i8, ptr [[TMP9]], i64 16
+; DEFAULT-NEXT:    store <16 x i8> [[TMP7]], ptr [[TMP9]], align 1
+; DEFAULT-NEXT:    store <16 x i8> [[TMP8]], ptr [[TMP10]], align 1
+; DEFAULT-NEXT:    [[INDEX_NEXT]] = add nuw i64 [[INDEX]], 32
+; DEFAULT-NEXT:    [[TMP11:%.*]] = icmp eq i64 [[INDEX_NEXT]], [[N_VEC]]
+; DEFAULT-NEXT:    br i1 [[TMP11]], label %[[MIDDLE_BLOCK:.*]], label %[[VECTOR_BODY]], !llvm.loop [[LOOP0:![0-9]+]]
+; DEFAULT:       [[MIDDLE_BLOCK]]:
+; DEFAULT-NEXT:    [[CMP_N:%.*]] = icmp eq i64 [[N]], [[N_VEC]]
+; DEFAULT-NEXT:    br i1 [[CMP_N]], label %[[EXIT:.*]], label %[[VEC_EPILOG_ITER_CHECK:.*]]
+; DEFAULT:       [[VEC_EPILOG_ITER_CHECK]]:
+; DEFAULT-NEXT:    [[MIN_EPILOG_ITERS_CHECK:%.*]] = icmp ult i64 [[TMP0]], 8
+; DEFAULT-NEXT:    br i1 [[MIN_EPILOG_ITERS_CHECK]], label %[[VEC_EPILOG_SCALAR_PH]], label %[[VEC_EPILOG_PH]], !prof [[PROF3:![0-9]+]]
+; DEFAULT:       [[VEC_EPILOG_PH]]:
+; DEFAULT-NEXT:    [[VEC_EPILOG_RESUME_VAL:%.*]] = phi i64 [ [[N_VEC]], %[[VEC_EPILOG_ITER_CHECK]] ], [ 0, %[[VECTOR_MAIN_LOOP_ITER_CHECK]] ]
+; DEFAULT-NEXT:    [[TMP12:%.*]] = and i64 [[N]], 7
+; DEFAULT-NEXT:    [[N_VEC9:%.*]] = sub i64 [[N]], [[TMP12]]
+; DEFAULT-NEXT:    [[TMP13:%.*]] = mul i64 [[N_VEC9]], 3
+; DEFAULT-NEXT:    [[TMP14:%.*]] = getelementptr i8, ptr [[S]], i64 [[TMP13]]
+; DEFAULT-NEXT:    br label %[[VEC_EPILOG_VECTOR_BODY:.*]]
+; DEFAULT:       [[VEC_EPILOG_VECTOR_BODY]]:
+; DEFAULT-NEXT:    [[INDEX10:%.*]] = phi i64 [ [[VEC_EPILOG_RESUME_VAL]], %[[VEC_EPILOG_PH]] ], [ [[INDEX_NEXT16:%.*]], %[[VEC_EPILOG_VECTOR_BODY]] ]
+; DEFAULT-NEXT:    [[TMP15:%.*]] = mul i64 [[INDEX10]], 3
+; DEFAULT-NEXT:    [[NEXT_GEP11:%.*]] = getelementptr i8, ptr [[S]], i64 [[TMP15]]
+; DEFAULT-NEXT:    [[WIDE_VEC12:%.*]] = load <24 x i8>, ptr [[NEXT_GEP11]], align 1
+; DEFAULT-NEXT:    [[STRIDED_VEC13:%.*]] = shufflevector <24 x i8> [[WIDE_VEC12]], <24 x i8> poison, <8 x i32> <i32 0, i32 3, i32 6, i32 9, i32 12, i32 15, i32 18, i32 21>
+; DEFAULT-NEXT:    [[STRIDED_VEC14:%.*]] = shufflevector <24 x i8> [[WIDE_VEC12]], <24 x i8> poison, <8 x i32> <i32 1, i32 4, i32 7, i32 10, i32 13, i32 16, i32 19, i32 22>
+; DEFAULT-NEXT:    [[STRIDED_VEC15:%.*]] = shufflevector <24 x i8> [[WIDE_VEC12]], <24 x i8> poison, <8 x i32> <i32 2, i32 5, i32 8, i32 11, i32 14, i32 17, i32 20, i32 23>
+; DEFAULT-NEXT:    [[TMP16:%.*]] = add <8 x i8> [[STRIDED_VEC13]], [[STRIDED_VEC14]]
+; DEFAULT-NEXT:    [[TMP17:%.*]] = add <8 x i8> [[TMP16]], [[STRIDED_VEC15]]
+; DEFAULT-NEXT:    [[TMP18:%.*]] = getelementptr inbounds i8, ptr [[D]], i64 [[INDEX10]]
+; DEFAULT-NEXT:    store <8 x i8> [[TMP17]], ptr [[TMP18]], align 1
+; DEFAULT-NEXT:    [[INDEX_NEXT16]] = add nuw i64 [[INDEX10]], 8
+; DEFAULT-NEXT:    [[TMP19:%.*]] = icmp eq i64 [[INDEX_NEXT16]], [[N_VEC9]]
+; DEFAULT-NEXT:    br i1 [[TMP19]], label %[[VEC_EPILOG_MIDDLE_BLOCK:.*]], label %[[VEC_EPILOG_VECTOR_BODY]], !llvm.loop [[LOOP4:![0-9]+]]
+; DEFAULT:       [[VEC_EPILOG_MIDDLE_BLOCK]]:
+; DEFAULT-NEXT:    [[CMP_N17:%.*]] = icmp eq i64 [[N]], [[N_VEC9]]
+; DEFAULT-NEXT:    br i1 [[CMP_N17]], label %[[EXIT]], label %[[VEC_EPILOG_SCALAR_PH]]
+; DEFAULT:       [[VEC_EPILOG_SCALAR_PH]]:
+; DEFAULT-NEXT:    [[BC_RESUME_VAL:%.*]] = phi i64 [ [[N_VEC9]], %[[VEC_EPILOG_MIDDLE_BLOCK]] ], [ [[N_VEC]], %[[VEC_EPILOG_ITER_CHECK]] ], [ 0, %[[VECTOR_SCEVCHECK]] ], [ 0, %[[ITER_CHECK]] ]
+; DEFAULT-NEXT:    [[BC_RESUME_VAL18:%.*]] = phi ptr [ [[TMP14]], %[[VEC_EPILOG_MIDDLE_BLOCK]] ], [ [[TMP2]], %[[VEC_EPILOG_ITER_CHECK]] ], [ [[S]], %[[VECTOR_SCEVCHECK]] ], [ [[S]], %[[ITER_CHECK]] ]
 ; DEFAULT-NEXT:    br label %[[LOOP:.*]]
 ; DEFAULT:       [[LOOP]]:
-; DEFAULT-NEXT:    [[I:%.*]] = phi i64 [ 0, %[[ENTRY]] ], [ [[I_NEXT:%.*]], %[[LOOP]] ]
-; DEFAULT-NEXT:    [[P:%.*]] = phi ptr [ [[S]], %[[ENTRY]] ], [ [[P_NEXT:%.*]], %[[LOOP]] ]
+; DEFAULT-NEXT:    [[I:%.*]] = phi i64 [ [[BC_RESUME_VAL]], %[[VEC_EPILOG_SCALAR_PH]] ], [ [[I_NEXT:%.*]], %[[LOOP]] ]
+; DEFAULT-NEXT:    [[P:%.*]] = phi ptr [ [[BC_RESUME_VAL18]], %[[VEC_EPILOG_SCALAR_PH]] ], [ [[P_NEXT:%.*]], %[[LOOP]] ]
 ; DEFAULT-NEXT:    [[P1:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 1
 ; DEFAULT-NEXT:    [[P2:%.*]] = getelementptr inbounds i8, ptr [[P]], i64 2
 ; DEFAULT-NEXT:    [[X:%.*]] = load i8, ptr [[P]], align 1
@@ -48,7 +132,7 @@ define void @epilogue(ptr noalias %d, ptr noalias %s, i64 %n, i64 %st) {
 ; DEFAULT-NEXT:    [[P_NEXT]] = getelementptr inbounds i8, ptr [[P]], i64 [[ST]]
 ; DEFAULT-NEXT:    [[I_NEXT]] = add i64 [[I]], 1
 ; DEFAULT-NEXT:    [[EC:%.*]] = icmp eq i64 [[I_NEXT]], [[N]]
-; DEFAULT-NEXT:    br i1 [[EC]], label %[[EXIT:.*]], label %[[LOOP]]
+; DEFAULT-NEXT:    br i1 [[EC]], label %[[EXIT]], label %[[LOOP]], !llvm.loop [[LOOP5:![0-9]+]]
 ; DEFAULT:       [[EXIT]]:
 ; DEFAULT-NEXT:    ret void
 ;

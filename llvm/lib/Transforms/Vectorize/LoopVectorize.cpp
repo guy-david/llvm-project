@@ -6309,6 +6309,33 @@ void LoopVectorizationPlanner::buildVPlans(VPlan &VPlan1, ElementCount MinVF,
   }
 }
 
+/// Returns true if \p Plan vectorizes every memory access using a stride
+/// speculated for a pointer induction as a member of an interleave group.
+static bool
+planInterleavesSpeculatedAccesses(Loop *L, const LoopVectorizationLegality &LVL,
+                                  VPlan &Plan) {
+  const SmallPtrSetImpl<const SCEVUnknown *> &Speculated =
+      LVL.getSpeculatedStrides();
+  if (Speculated.empty())
+    return true;
+  SmallPtrSet<Instruction *, 8> Interleaved;
+  for (VPBasicBlock *VPBB : VPBlockUtils::blocksOnly<VPBasicBlock>(
+           vp_depth_first_deep(Plan.getEntry())))
+    for (VPRecipeBase &R : *VPBB)
+      if (auto *IR = dyn_cast<VPInterleaveBase>(&R))
+        Interleaved.insert_range(IR->getInterleaveGroup()->members());
+  const SymbolicStrideMap &Strides = LVL.getLAI()->getSymbolicStrides();
+  for (BasicBlock *BB : L->blocks()) {
+    for (Instruction &I : *BB) {
+      auto It = Strides.find(getLoadStorePointerOperand(&I));
+      if (It != Strides.end() && Speculated.contains(It->second.Stride) &&
+          !Interleaved.contains(&I))
+        return false;
+    }
+  }
+  return true;
+}
+
 VPlanPtr
 LoopVectorizationPlanner::tryToBuildVPlan(VPlanPtr Plan, VFRange &Range,
                                           LoopVectorizationCostModel &PlanCM) {
@@ -6524,6 +6551,13 @@ LoopVectorizationPlanner::tryToBuildVPlan(VPlanPtr Plan, VFRange &Range,
   // single VPInterleaveRecipe at its insertion point.
   RUN_VPLAN_PASS(VPlanTransforms::createInterleaveGroups, *Plan,
                  InterleaveGroups, PlanCM.isEpilogueAllowed());
+
+  // A stride speculated for a pointer induction only pays off if the accesses
+  // using it are interleaved, so do not build vector plans that do not. The
+  // scalar plan is kept, as VF selection compares against it.
+  if (Range.Start.isVector() &&
+      !planInterleavesSpeculatedAccesses(OrigLoop, *Legal, *Plan))
+    return nullptr;
 
   // Convert memory recipes to strided access recipes if the strided access is
   // legal and profitable.
@@ -7459,6 +7493,17 @@ bool LoopVectorizePass::processLoop(Loop *L) {
       IAI.invalidateGroupsRequiringScalarEpilogue();
   }
 
+  // Without interleave groups, no vector plan can use a speculated stride.
+  if (!LVL.getSpeculatedStrides().empty() && !IAI.hasGroups()) {
+    reportVectorizationFailure(
+        "Accesses with a speculated stride are not interleaved",
+        "accesses with a speculated stride are not vectorized as interleave "
+        "groups",
+        "SpeculatedStrideNotInterleaved", ORE, L);
+    Hints.emitRemarkWithHints();
+    return false;
+  }
+
   if (LVL.hasUncountableEarlyExit()) {
     BasicBlock *LoopLatch = L->getLoopLatch();
     if (IAI.requiresScalarEpilogue() ||
@@ -7587,6 +7632,17 @@ bool LoopVectorizePass::processLoop(Loop *L) {
   LVP.plan(UserVF, UserIC);
   auto [VF, BestPlanPtr] = LVP.computeBestVF();
   unsigned IC = 1;
+
+  // A speculated stride does not pay off for the scalar loop either.
+  if (VF.Width.isScalar() && !LVL.getSpeculatedStrides().empty()) {
+    reportVectorizationFailure(
+        "Accesses with a speculated stride are not interleaved",
+        "accesses with a speculated stride are not vectorized as interleave "
+        "groups",
+        "SpeculatedStrideNotInterleaved", ORE, L);
+    Hints.emitRemarkWithHints();
+    return false;
+  }
 
   // For VPlan build stress testing of outer loops, bail after plan
   // construction.
